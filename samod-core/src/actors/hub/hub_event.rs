@@ -50,6 +50,24 @@ impl HubEvent {
         }
     }
 
+    pub fn local_handles_acquired(document_id: DocumentId, generation: u64) -> Self {
+        HubEvent {
+            payload: HubEventPayload::Input(HubInput::LocalHandlesAcquired {
+                document_id,
+                generation,
+            }),
+        }
+    }
+
+    pub fn local_handles_dropped(document_id: DocumentId, generation: u64) -> Self {
+        HubEvent {
+            payload: HubEventPayload::Input(HubInput::LocalHandlesDropped {
+                document_id,
+                generation,
+            }),
+        }
+    }
+
     /// Creates a command to receive a message on a specific connection.
     pub fn receive(connection_id: ConnectionId, msg: Vec<u8>) -> DispatchedCommand {
         Self::dispatch_command(Command::Receive { connection_id, msg })
@@ -206,6 +224,8 @@ impl HubEvent {
                 },
                 HubInput::Tick => "tick",
                 HubInput::ActorMessage { .. } => "actor_message",
+                HubInput::LocalHandlesAcquired { .. } => "local_handles_acquired",
+                HubInput::LocalHandlesDropped { .. } => "local_handles_dropped",
                 HubInput::ConnectionLost { .. } => "connection_lost",
                 HubInput::AddDialer { .. } => "add_dialer",
                 HubInput::AddListener { .. } => "add_listener",

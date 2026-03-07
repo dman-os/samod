@@ -7,7 +7,10 @@ use automerge::{Automerge, ReadDoc};
 use futures::{Stream, StreamExt};
 use samod_core::{AutomergeUrl, DocumentChanged, DocumentId};
 
-use crate::{ConnectionId, doc_actor_inner::DocActorInner, peer_connection_info::PeerDocState};
+use crate::{
+    ConnectionId, doc_actor_inner::DocActorInner, doc_lease::DocLease,
+    peer_connection_info::PeerDocState,
+};
 
 /// The state of a single [`automerge`] document the [`Repo`](crate::Repo) is managing
 ///
@@ -28,6 +31,7 @@ use crate::{ConnectionId, doc_actor_inner::DocActorInner, peer_connection_info::
 pub struct DocHandle {
     inner: Arc<Mutex<DocActorInner>>,
     document_id: DocumentId,
+    lease: Arc<DocLease>,
 }
 
 impl std::fmt::Debug for DocHandle {
@@ -39,10 +43,15 @@ impl std::fmt::Debug for DocHandle {
 }
 
 impl DocHandle {
-    pub(crate) fn new(doc_id: DocumentId, inner: Arc<Mutex<DocActorInner>>) -> Self {
+    pub(crate) fn new(
+        doc_id: DocumentId,
+        inner: Arc<Mutex<DocActorInner>>,
+        lease: Arc<DocLease>,
+    ) -> Self {
         Self {
             document_id: doc_id,
             inner,
+            lease,
         }
     }
 
@@ -76,13 +85,29 @@ impl DocHandle {
     }
 
     /// Listen to ephemeral messages sent by other peers to this document
-    pub fn ephemera(&self) -> impl Stream<Item = Vec<u8>> {
-        self.inner.lock().unwrap().create_ephemera_listener()
+    pub fn ephemera(&self) -> impl Stream<Item = Vec<u8>> + use<> {
+        let lease = self.lease.clone();
+        self.inner
+            .lock()
+            .unwrap()
+            .create_ephemera_listener()
+            .map(move |msg| {
+                let _lease = &lease;
+                msg
+            })
     }
 
     /// Listen for changes to the document
-    pub fn changes(&self) -> impl Stream<Item = DocumentChanged> {
-        self.inner.lock().unwrap().create_change_listener()
+    pub fn changes(&self) -> impl Stream<Item = DocumentChanged> + use<> {
+        let lease = self.lease.clone();
+        self.inner
+            .lock()
+            .unwrap()
+            .create_change_listener()
+            .map(move |change| {
+                let _lease = &lease;
+                change
+            })
     }
 
     /// Send an ephemeral message which will be broadcast to all other peers who have this document open
@@ -106,13 +131,21 @@ impl DocHandle {
         HashMap<ConnectionId, PeerDocState>,
         impl Stream<Item = HashMap<ConnectionId, PeerDocState>> + 'static + use<>,
     ) {
-        self.inner.lock().unwrap().peers()
+        let lease = self.lease.clone();
+        let (current, changes) = self.inner.lock().unwrap().peers();
+        let changes = changes.map(move |change| {
+            let _lease = &lease;
+            change
+        });
+        (current, changes)
     }
 
     /// Wait for a connection to have said they have everything we have
     pub fn they_have_our_changes(&self, conn: ConnectionId) -> impl Future<Output = ()> + 'static {
         let inner = self.inner.clone();
+        let lease = self.lease.clone();
         async move {
+            let _lease = lease;
             let mut state_changes = {
                 let mut inner = inner.lock().unwrap();
                 let local_heads = inner.document().get_heads();
@@ -140,7 +173,9 @@ impl DocHandle {
 
     pub fn we_have_their_changes(&self, conn: ConnectionId) -> impl Future<Output = ()> + 'static {
         let inner = self.inner.clone();
+        let lease = self.lease.clone();
         async move {
+            let _lease = lease;
             let mut state_changes = {
                 let mut inner = inner.lock().unwrap();
                 let (current, state_changes) = inner.peers();

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     ConnectionId, DialerId, DocumentActorId, DocumentId, ListenerId, PeerId, StorageId,
@@ -63,6 +63,8 @@ pub(crate) struct State {
     /// change detection so we only send updates when something changed.
     last_dialer_states: HashMap<DialerId, DocDialerState>,
 }
+
+const LOCAL_EVICTION_GRACE: Duration = Duration::from_secs(1);
 
 impl State {
     pub(crate) fn new(
@@ -295,6 +297,48 @@ impl State {
         }
     }
 
+    fn handle_local_handles_acquired(&mut self, document_id: DocumentId, generation: u64) {
+        let Some(actor_id) = self.document_to_actor.get(&document_id).copied() else {
+            tracing::debug!(%document_id, generation, "local handle acquire for unknown document");
+            return;
+        };
+        let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+            tracing::warn!(?actor_id, %document_id, "actor missing for local handle acquire");
+            return;
+        };
+        actor_info.has_local_handles = true;
+        actor_info.local_handle_generation = generation;
+        actor_info.last_local_handle_drop_at = None;
+        actor_info.eviction_requested = false;
+    }
+
+    fn handle_local_handles_dropped(
+        &mut self,
+        now: UnixTimestamp,
+        document_id: DocumentId,
+        generation: u64,
+    ) {
+        let Some(actor_id) = self.document_to_actor.get(&document_id).copied() else {
+            tracing::debug!(%document_id, generation, "local handle drop for unknown document");
+            return;
+        };
+        let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+            tracing::warn!(?actor_id, %document_id, "actor missing for local handle drop");
+            return;
+        };
+        if actor_info.local_handle_generation != generation {
+            tracing::trace!(
+                %document_id,
+                generation,
+                current_generation = actor_info.local_handle_generation,
+                "ignoring stale local handle drop notification"
+            );
+            return;
+        }
+        actor_info.has_local_handles = false;
+        actor_info.last_local_handle_drop_at = Some(now);
+    }
+
     pub(crate) fn ensure_connections(&mut self) -> Vec<(DocumentActorId, ConnectionId, PeerId)> {
         let mut to_connect = Vec::new();
         for (conn_id, conn) in &mut self.connections {
@@ -342,6 +386,62 @@ impl State {
             } else {
                 tracing::warn!(?conn, "connection not found when updating peer states");
             }
+        }
+    }
+
+    fn has_established_connection_subscription(&self, document_id: &DocumentId) -> bool {
+        self.connections.values().any(|connection| {
+            connection
+                .established_connection()
+                .map(|established| {
+                    established
+                        .document_subscriptions()
+                        .contains_key(document_id)
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn remove_document_actor(&mut self, actor_id: DocumentActorId) {
+        let Some(actor_info) = self.actors.remove(&actor_id) else {
+            return;
+        };
+        self.document_to_actor.remove(&actor_info.document_id);
+        for connection in self.connections.values_mut() {
+            if let Some(established) = connection.established_connection_mut() {
+                established.remove_document_subscription(&actor_info.document_id);
+            }
+        }
+    }
+
+    fn maybe_evict_idle_actors(&mut self, now: UnixTimestamp, results: &mut HubResults) {
+        let mut to_terminate = Vec::new();
+        let candidates = self
+            .actors
+            .values()
+            .filter_map(|actor_info| {
+                if actor_info.has_local_handles || actor_info.eviction_requested {
+                    return None;
+                }
+                let dropped_at = actor_info.last_local_handle_drop_at?;
+                if now - dropped_at < LOCAL_EVICTION_GRACE {
+                    return None;
+                }
+                if self.has_established_connection_subscription(&actor_info.document_id) {
+                    return None;
+                }
+                Some(actor_info.actor_id)
+            })
+            .collect::<Vec<_>>();
+        for actor_id in candidates {
+            let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+                continue;
+            };
+            actor_info.eviction_requested = true;
+            to_terminate.push(actor_id);
+        }
+        for actor_id in to_terminate {
+            results.send_to_doc_actor(actor_id, HubToDocMsgPayload::Terminate);
         }
     }
 
@@ -470,9 +570,21 @@ impl State {
                         }
                         DocToHubMsgPayload::Terminated => {
                             tracing::debug!(?actor_id, "document actor terminated");
-                            self.actors.remove(&actor_id);
+                            self.remove_document_actor(actor_id);
                         }
                     },
+                    HubInput::LocalHandlesAcquired {
+                        document_id,
+                        generation,
+                    } => {
+                        self.handle_local_handles_acquired(document_id, generation);
+                    }
+                    HubInput::LocalHandlesDropped {
+                        document_id,
+                        generation,
+                    } => {
+                        self.handle_local_handles_dropped(now, document_id, generation);
+                    }
                     HubInput::ConnectionLost { connection_id } => {
                         self.handle_connection_lost(rng, now, results, connection_id);
                     }
@@ -1290,6 +1402,8 @@ impl State {
                 results.emit_dial_request(DialRequest { dialer_id, url });
             }
         }
+
+        self.maybe_evict_idle_actors(now, results);
     }
 
     /// Reset backoff for a dialer when a handshake completes successfully.
