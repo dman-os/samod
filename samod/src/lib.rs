@@ -331,6 +331,7 @@ mod dialer;
 pub use dialer::Dialer;
 mod doc_actor_inner;
 mod doc_handle;
+mod doc_lease;
 mod doc_runner;
 mod io_loop;
 mod observer;
@@ -351,6 +352,7 @@ pub use crate::builder::ConcurrencyConfig;
 use crate::{
     connection::ConnectionHandle,
     doc_actor_inner::DocActorInner,
+    doc_lease::{DocLease, LeaseNotification},
     doc_runner::{DocRunner, SpawnedActor},
     io_loop::{DriveConnectionTask, IoLoopTask},
     storage::Storage,
@@ -508,18 +510,10 @@ impl Repo {
             Ok(r) => match r {
                 CommandResult::CreateDocument {
                     actor_id,
-                    document_id: _,
+                    document_id,
                 } => {
-                    {
-                        let inner = inner.lock().unwrap();
-                        // By this point the document should have been spawned
-
-                        Ok(inner
-                            .actors
-                            .get(&actor_id)
-                            .map(|ActorHandle { doc: handle, .. }| handle.clone())
-                            .expect("actor should exist"))
-                    }
+                    let mut inner = inner.lock().unwrap();
+                    Ok(inner.acquire_doc_handle(actor_id, document_id))
                 }
                 other => {
                     panic!("unexpected command result for create: {other:?}");
@@ -558,14 +552,13 @@ impl Repo {
                 Ok(r) => match r {
                     CommandResult::FindDocument { actor_id, found } => {
                         if found {
-                            // By this point the document should have been spawned
-                            let handle = inner
-                                .lock()
-                                .unwrap()
+                            let mut guard = inner.lock().unwrap();
+                            let document_id = guard
                                 .actors
                                 .get(&actor_id)
-                                .map(|ActorHandle { doc: handle, .. }| handle.clone())
+                                .map(|actor| actor.inner.lock().unwrap().document_id().clone())
                                 .expect("actor should exist");
+                            let handle = guard.acquire_doc_handle(actor_id, document_id);
                             Ok(Some(handle))
                         } else {
                             Ok(None)
@@ -841,6 +834,7 @@ struct Inner {
     dialer_handles: HashMap<DialerId, DialerHandle>,
     acceptor_handles: HashMap<ListenerId, AcceptorHandle>,
     observer: Option<Arc<dyn observer::RepoObserver>>,
+    tx_repo_events: UnboundedSender<LeaseNotification>,
 }
 
 impl Inner {
@@ -875,6 +869,48 @@ impl Inner {
                 let _ = tx.unbounded_send(task);
             }
         }
+    }
+
+    fn acquire_doc_handle(
+        &mut self,
+        actor_id: DocumentActorId,
+        document_id: DocumentId,
+    ) -> DocHandle {
+        let (inner, existing_lease, next_generation) = {
+            let actor_handle = self
+                .actors
+                .get_mut(&actor_id)
+                .expect("actor should exist when acquiring handle");
+            let inner = actor_handle.inner.clone();
+            let existing_lease = actor_handle.lease.upgrade();
+            let next_generation = if existing_lease.is_none() {
+                actor_handle.lease_generation += 1;
+                Some(actor_handle.lease_generation)
+            } else {
+                None
+            };
+            (inner, existing_lease, next_generation)
+        };
+        let lease = if let Some(lease) = existing_lease {
+            lease
+        } else {
+            let generation = next_generation.expect("missing lease generation");
+            let lease = Arc::new(DocLease::new(
+                document_id.clone(),
+                generation,
+                self.tx_repo_events.clone(),
+            ));
+            self.actors
+                .get_mut(&actor_id)
+                .expect("actor should exist when storing lease")
+                .lease = Arc::downgrade(&lease);
+            self.handle_event(HubEvent::local_handles_acquired(
+                document_id.clone(),
+                generation,
+            ));
+            lease
+        };
+        DocHandle::new(document_id, inner, lease)
     }
 
     #[tracing::instrument(skip(self, event), fields(local_peer_id=%self.hub.peer_id()))]
@@ -1121,12 +1157,12 @@ impl Inner {
             self.tx_io.clone(),
             self.observer.clone(),
         )));
-        let handle = DocHandle::new(doc_id.clone(), doc_inner.clone());
         self.actors.insert(
             actor_id,
             ActorHandle {
                 inner: doc_inner.clone(),
-                doc: handle,
+                lease: std::sync::Weak::new(),
+                lease_generation: 0,
             },
         );
 
@@ -1230,6 +1266,7 @@ struct TaskSetup {
     tx_io: UnboundedSender<IoLoopTask>,
     rx_storage: UnboundedReceiver<IoLoopTask>,
     rx_from_core: UnboundedReceiver<(DocumentActorId, DocToHubMsg)>,
+    rx_repo_events: UnboundedReceiver<LeaseNotification>,
     rx_actor: Option<UnboundedReceiver<SpawnedActor>>,
     dialers: Arc<Mutex<HashMap<DialerId, io_loop::DynDialer>>>,
     observer: Option<Arc<dyn observer::RepoObserver>>,
@@ -1249,6 +1286,7 @@ impl TaskSetup {
         let (tx_storage, rx_storage) = unbounded::channel();
         let tx_io_for_tick = tx_storage.clone();
         let (tx_to_core, rx_from_core) = unbounded::channel();
+        let (tx_repo_events, rx_repo_events) = unbounded::channel();
         let rx_actor: Option<UnboundedReceiver<SpawnedActor>>;
         let doc_runner = match concurrency {
             #[cfg(feature = "threadpool")]
@@ -1283,6 +1321,7 @@ impl TaskSetup {
             dialer_handles: HashMap::new(),
             acceptor_handles: HashMap::new(),
             observer: observer.clone(),
+            tx_repo_events,
         }));
 
         TaskSetup {
@@ -1291,6 +1330,7 @@ impl TaskSetup {
             tx_io: tx_io_for_tick,
             rx_actor,
             rx_from_core,
+            rx_repo_events,
             rx_storage,
             dialers,
             observer,
@@ -1329,6 +1369,26 @@ impl TaskSetup {
                 }
             }
             .instrument(tracing::info_span!("actor_loop", local_peer_id=%peer_id))
+            .boxed_local()
+        });
+        runtime.spawn({
+            let peer_id = self.peer_id.clone();
+            let inner = self.inner.clone();
+            async move {
+                let rx = self.rx_repo_events;
+                while let Ok(msg) = rx.recv().await {
+                    match msg {
+                        LeaseNotification::Dropped {
+                            document_id,
+                            generation,
+                        } => {
+                            let event = HubEvent::local_handles_dropped(document_id, generation);
+                            inner.lock().unwrap().handle_event(event);
+                        }
+                    }
+                }
+            }
+            .instrument(tracing::info_span!("lease_loop", local_peer_id=%peer_id))
             .boxed_local()
         });
         {
@@ -1371,6 +1431,26 @@ impl TaskSetup {
                 }
             }
             .instrument(tracing::info_span!("actor_loop", local_peer_id=%peer_id))
+            .boxed()
+        });
+        runtime.spawn({
+            let peer_id = self.peer_id.clone();
+            let inner = self.inner.clone();
+            async move {
+                let rx = self.rx_repo_events;
+                while let Ok(msg) = rx.recv().await {
+                    match msg {
+                        LeaseNotification::Dropped {
+                            document_id,
+                            generation,
+                        } => {
+                            let event = HubEvent::local_handles_dropped(document_id, generation);
+                            inner.lock().unwrap().handle_event(event);
+                        }
+                    }
+                }
+            }
+            .instrument(tracing::info_span!("lease_loop", local_peer_id=%peer_id))
             .boxed()
         });
         {

@@ -58,6 +58,10 @@ impl DocActorInner {
         self.actor.document()
     }
 
+    pub(crate) fn document_id(&self) -> &DocumentId {
+        &self.document_id
+    }
+
     pub(crate) fn with_document<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut Automerge) -> R,
