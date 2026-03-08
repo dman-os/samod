@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use automerge::{Automerge, ChangeHash};
 
@@ -39,6 +39,8 @@ pub struct DocumentActor {
     load_state: Load,
     /// Sync states for each connected peer
     peer_connections: HashMap<ConnectionId, PeerDocConnection>,
+    /// Connections currently holding remote retention pins in the hub.
+    remote_pinned_connections: HashSet<ConnectionId>,
     on_disk_state: OnDiskState,
     /// Ongoing policy check tasks
     check_policy_tasks: HashMap<IoTaskId, ConnectionId>,
@@ -89,6 +91,7 @@ impl DocumentActor {
             check_policy_tasks: HashMap::new(),
             on_disk_state: OnDiskState::new(),
             peer_connections: HashMap::new(),
+            remote_pinned_connections: HashSet::new(),
             run_state: RunState::Running,
             dialer_states,
         };
@@ -324,7 +327,7 @@ impl DocumentActor {
                 self.add_connection(connection_id, peer_id);
             }
             ActorInput::ConnectionClosed { connection_id } => {
-                self.remove_connection(connection_id);
+                self.remove_connection(out, connection_id);
             }
             ActorInput::Request => {
                 self.load_state.begin();
@@ -355,8 +358,10 @@ impl DocumentActor {
                             AnnouncePolicy::DontAnnounce
                         };
                         if let Some(peer_conn) = self.peer_connections.get_mut(&conn_id) {
+                            let old_policy = peer_conn.announce_policy();
                             peer_conn.set_announce_policy(policy);
                             self.doc_state.set_announce_policy(out, conn_id, policy);
+                            self.update_remote_pin(out, conn_id, old_policy, policy);
                         } else {
                             tracing::warn!(
                                 ?conn_id,
@@ -397,6 +402,7 @@ impl DocumentActor {
         }
         if self.run_state == RunState::Stopping {
             if self.on_disk_state.is_flushed() {
+                self.release_all_remote_pins(out);
                 self.run_state = RunState::Stopped;
                 out.send_terminated();
                 out.stopped = true;
@@ -485,9 +491,48 @@ impl DocumentActor {
         self.doc_state.add_connection(conn.get());
     }
 
-    fn remove_connection(&mut self, conn_id: ConnectionId) {
+    fn remove_connection(&mut self, out: &mut DocActorResult, conn_id: ConnectionId) {
         self.peer_connections.remove(&conn_id);
         self.doc_state.remove_connection(conn_id);
+        if self.remote_pinned_connections.remove(&conn_id) {
+            out.outgoing_messages
+                .push(DocToHubMsg(DocToHubMsgPayload::RemotePinReleased {
+                    connection_id: conn_id,
+                }));
+        }
+    }
+
+    fn update_remote_pin(
+        &mut self,
+        out: &mut DocActorResult,
+        conn_id: ConnectionId,
+        old_policy: AnnouncePolicy,
+        new_policy: AnnouncePolicy,
+    ) {
+        if old_policy != AnnouncePolicy::Announce && new_policy == AnnouncePolicy::Announce {
+            if self.remote_pinned_connections.insert(conn_id) {
+                out.outgoing_messages
+                    .push(DocToHubMsg(DocToHubMsgPayload::RemotePinAcquired {
+                        connection_id: conn_id,
+                    }));
+            }
+        } else if old_policy == AnnouncePolicy::Announce && new_policy != AnnouncePolicy::Announce {
+            if self.remote_pinned_connections.remove(&conn_id) {
+                out.outgoing_messages
+                    .push(DocToHubMsg(DocToHubMsgPayload::RemotePinReleased {
+                        connection_id: conn_id,
+                    }));
+            }
+        }
+    }
+
+    fn release_all_remote_pins(&mut self, out: &mut DocActorResult) {
+        for conn_id in std::mem::take(&mut self.remote_pinned_connections) {
+            out.outgoing_messages
+                .push(DocToHubMsg(DocToHubMsgPayload::RemotePinReleased {
+                    connection_id: conn_id,
+                }));
+        }
     }
 
     /// Returns true if any dialer is actively connecting (i.e. in
