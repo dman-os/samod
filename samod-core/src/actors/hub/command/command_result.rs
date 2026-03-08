@@ -20,6 +20,14 @@ pub enum CommandResult {
         actor_id: DocumentActorId,
         document_id: DocumentId,
     },
+    /// Result of ImportDocument command.
+    ImportDocument {
+        actor_id: DocumentActorId,
+        document_id: DocumentId,
+    },
+    ImportDocumentAlreadyExists {
+        document_id: DocumentId,
+    },
     /// Result of FindDocument command.
     FindDocument {
         actor_id: DocumentActorId,
