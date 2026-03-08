@@ -28,6 +28,12 @@ pub(crate) enum Command {
     /// Creates a new document.
     CreateDocument { content: Box<Automerge> },
 
+    /// Imports a document with an explicit document ID.
+    ImportDocument {
+        document_id: DocumentId,
+        content: Box<Automerge>,
+    },
+
     /// Finds and loads an existing document.
     FindDocument { document_id: DocumentId },
 }
@@ -46,6 +52,14 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Command::CreateDocument { content: _ } => f
                 .debug_struct("CreateDocument")
+                .field("content", &"<Automerge>")
+                .finish(),
+            Command::ImportDocument {
+                document_id,
+                content: _,
+            } => f
+                .debug_struct("ImportDocument")
+                .field("document_id", document_id)
                 .field("content", &"<Automerge>")
                 .finish(),
             Command::FindDocument { document_id } => f

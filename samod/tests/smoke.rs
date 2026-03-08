@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use automerge::Automerge;
-use samod::{PeerId, Repo, RepoEvent, RepoObserver, storage::InMemoryStorage};
+use automerge::{Automerge, ReadDoc};
+use samod::{ImportError, PeerId, Repo, RepoEvent, RepoObserver, storage::InMemoryStorage};
 mod tincans;
 
 fn init_logging() {
@@ -52,6 +52,18 @@ async fn wait_for_closed_count(observer: &CountingObserver, expected: usize) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn make_doc_with_field(value: &str) -> Automerge {
+    let mut doc = Automerge::new();
+    doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+        use automerge::transaction::Transactable;
+
+        tx.put(automerge::ROOT, "value", value)?;
+        Ok(())
+    })
+    .unwrap();
+    doc
 }
 
 #[tokio::test]
@@ -790,7 +802,6 @@ async fn connected_documents_are_not_evicted_when_handle_drops() {
     alice.stop().await;
     bob.stop().await;
 }
-
 #[tokio::test]
 async fn non_announced_connected_documents_are_evicted_when_handle_drops() {
     init_logging();
@@ -876,6 +887,145 @@ async fn disconnected_peers_do_not_evict_while_handle_is_alive() {
 
     drop(doc);
     wait_for_closed_count(&observer, 1).await;
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test]
+async fn import_round_trips_with_explicit_id() {
+    init_logging();
+
+    let storage = InMemoryStorage::new();
+    let repo = Repo::build_tokio()
+        .with_storage(storage.clone())
+        .load()
+        .await;
+
+    let document_id = samod::DocumentId::new(&mut rand::rng());
+    let handle = repo
+        .import(document_id.clone(), make_doc_with_field("imported"))
+        .await
+        .unwrap();
+    assert_eq!(handle.document_id(), &document_id);
+
+    repo.stop().await;
+
+    let reloaded = Repo::build_tokio().with_storage(storage).load().await;
+    let found = reloaded.find(document_id).await.unwrap().unwrap();
+    found.with_document(|doc| {
+        let value = doc.get(automerge::ROOT, "value").unwrap().unwrap().0;
+        assert_eq!(value.to_str(), Some("imported"));
+    });
+    reloaded.stop().await;
+}
+
+#[tokio::test]
+async fn import_rejects_existing_id() {
+    init_logging();
+
+    let repo = Repo::build_tokio().load().await;
+    let document_id = samod::DocumentId::new(&mut rand::rng());
+
+    let _ = repo
+        .import(document_id.clone(), make_doc_with_field("first"))
+        .await
+        .unwrap();
+
+    let result = repo
+        .import(document_id.clone(), make_doc_with_field("second"))
+        .await;
+    match result {
+        Err(ImportError::AlreadyExists {
+            document_id: actual,
+        }) => {
+            assert_eq!(actual, document_id);
+        }
+        other => panic!("unexpected import result: {other:?}"),
+    }
+
+    repo.stop().await;
+}
+
+#[tokio::test]
+async fn import_rejects_existing_id_in_cold_storage() {
+    init_logging();
+
+    let storage = InMemoryStorage::new();
+    let repo = Repo::build_tokio()
+        .with_storage(storage.clone())
+        .load()
+        .await;
+    let document_id = samod::DocumentId::new(&mut rand::rng());
+
+    let _ = repo
+        .import(document_id.clone(), make_doc_with_field("first"))
+        .await
+        .unwrap();
+    repo.stop().await;
+
+    let reopened = Repo::build_tokio().with_storage(storage).load().await;
+    let result = reopened
+        .import(document_id.clone(), make_doc_with_field("second"))
+        .await;
+    match result {
+        Err(ImportError::AlreadyExists {
+            document_id: actual,
+        }) => {
+            assert_eq!(actual, document_id);
+        }
+        other => panic!("unexpected import result: {other:?}"),
+    }
+
+    reopened.stop().await;
+}
+
+#[tokio::test]
+async fn imported_documents_with_separate_histories_sync_over_tincans() {
+    init_logging();
+
+    let alice = Repo::build_tokio()
+        .with_peer_id(PeerId::from("alice"))
+        .load()
+        .await;
+    let bob = Repo::build_tokio()
+        .with_peer_id(PeerId::from("bob"))
+        .load()
+        .await;
+
+    let alice_doc_id = samod::DocumentId::new(&mut rand::rng());
+    let bob_doc_id = samod::DocumentId::new(&mut rand::rng());
+
+    let alice_doc = alice
+        .import(alice_doc_id.clone(), make_doc_with_field("alice-history"))
+        .await
+        .unwrap();
+    let bob_doc = bob
+        .import(bob_doc_id.clone(), make_doc_with_field("bob-history"))
+        .await
+        .unwrap();
+
+    let _connected = tincans::connect_repos(&alice, &bob).await;
+
+    let bob_view_of_alice = bob.find(alice_doc_id.clone()).await.unwrap().unwrap();
+    let alice_view_of_bob = alice.find(bob_doc_id.clone()).await.unwrap().unwrap();
+
+    alice_doc.with_document(|doc| {
+        let value = doc.get(automerge::ROOT, "value").unwrap().unwrap().0;
+        assert_eq!(value.to_str(), Some("alice-history"));
+    });
+    bob_doc.with_document(|doc| {
+        let value = doc.get(automerge::ROOT, "value").unwrap().unwrap().0;
+        assert_eq!(value.to_str(), Some("bob-history"));
+    });
+    alice_view_of_bob.with_document(|doc| {
+        let value = doc.get(automerge::ROOT, "value").unwrap().unwrap().0;
+        assert_eq!(value.to_str(), Some("bob-history"));
+    });
+    bob_view_of_alice.with_document(|doc| {
+        let value = doc.get(automerge::ROOT, "value").unwrap().unwrap().0;
+        assert_eq!(value.to_str(), Some("alice-history"));
+    });
 
     alice.stop().await;
     bob.stop().await;

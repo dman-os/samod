@@ -8,7 +8,7 @@ use samod_core::{
     DialerId, DocumentActorId, DocumentId, PeerId,
     actors::{
         document::io::{DocumentIoResult, DocumentIoTask},
-        hub::{CommandResult, DispatchedCommand, HubEvent},
+        hub::{CommandResult, DispatchedCommand, HubEvent, io::HubIoResult},
     },
     io::{IoResult, IoTask, StorageResult, StorageTask},
 };
@@ -32,6 +32,9 @@ pub(crate) enum IoLoopTask {
         doc_id: DocumentId,
         task: IoTask<DocumentIoTask>,
         actor_id: DocumentActorId,
+    },
+    HubStorage {
+        task: IoTask<StorageTask>,
     },
     EstablishTransport {
         dialer_id: DialerId,
@@ -61,6 +64,10 @@ struct StorageTaskComplete {
     actor_id: DocumentActorId,
 }
 
+struct HubStorageTaskComplete {
+    result: IoResult<HubIoResult>,
+}
+
 /// Type alias for a shared, type-erased dialer.
 pub(crate) type DynDialer = Arc<dyn crate::Dialer>;
 
@@ -75,6 +82,7 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
     observer: Option<Arc<dyn RepoObserver>>,
 ) {
     let mut running_storage_tasks = FuturesUnordered::new();
+    let mut running_hub_storage_tasks = FuturesUnordered::new();
     let mut running_connections = FuturesUnordered::new();
     let mut running_transport_establishments = FuturesUnordered::new();
 
@@ -101,6 +109,21 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
                             }
                         });
                     },
+                    IoLoopTask::HubStorage { task } => {
+                        running_hub_storage_tasks.push({
+                            let storage = storage.clone();
+                            async move {
+                                let task_id = task.task_id;
+                                let result = dispatch_storage_task(task.action, storage).await;
+                                HubStorageTaskComplete {
+                                    result: IoResult {
+                                        task_id,
+                                        payload: HubIoResult::Storage(result),
+                                    },
+                                }
+                            }
+                        });
+                    }
                     IoLoopTask::DriveConnection(task) => {
                         running_connections.push(drive_connection(inner.clone(), task));
                     }
@@ -139,6 +162,9 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
                 let inner = inner.lock().unwrap();
                 inner.dispatch_task(actor_id, ActorTask::IoComplete(result));
             },
+            result = running_hub_storage_tasks.select_next_some() => {
+                inner.lock().unwrap().handle_event(HubEvent::io_complete(result.result));
+            },
             _ = running_connections.select_next_some() => {
 
             },
@@ -151,6 +177,12 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
     while let Some(StorageTaskComplete { result, actor_id }) = running_storage_tasks.next().await {
         let inner = inner.lock().unwrap();
         inner.dispatch_task(actor_id, ActorTask::IoComplete(result));
+    }
+    while let Some(HubStorageTaskComplete { result }) = running_hub_storage_tasks.next().await {
+        inner
+            .lock()
+            .unwrap()
+            .handle_event(HubEvent::io_complete(result));
     }
 }
 

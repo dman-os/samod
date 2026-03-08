@@ -1,4 +1,5 @@
 use automerge::{ReadDoc, transaction::Transactable};
+use samod_core::DocumentId;
 use samod_test_harness::{Network, RunningDocIds};
 
 fn init_logging() {
@@ -50,4 +51,44 @@ fn basic_create_and_find_change() {
         .expect("with_document should succeed");
 
     assert_eq!(verify_result, Some("test_value".to_string()));
+}
+
+#[test]
+fn import_with_explicit_id_rejects_existing_actor() {
+    init_logging();
+    let mut network = Network::new();
+    let bob = network.create_samod("Bob");
+
+    let requested_id = DocumentId::new(&mut rand::rng());
+
+    let RunningDocIds { doc_id, .. } = network
+        .samod(&bob)
+        .import_document(requested_id.clone(), None);
+    assert_eq!(doc_id, requested_id);
+
+    let duplicate = network
+        .samod(&bob)
+        .try_import_document(requested_id.clone(), None);
+    assert_eq!(duplicate, Err(requested_id));
+}
+
+#[test]
+fn import_with_explicit_id_rejects_existing_cold_storage() {
+    init_logging();
+    let mut network = Network::new();
+    let bob = network.create_samod("Bob");
+
+    let requested_id = DocumentId::new(&mut rand::rng());
+    network
+        .samod(&bob)
+        .import_document(requested_id.clone(), None);
+
+    let storage = network.samod(&bob).storage().clone();
+    network.samod(&bob).stop();
+
+    let bob_reloaded = network.create_samod_with_storage("Bob-reloaded", storage);
+    let duplicate = network
+        .samod(&bob_reloaded)
+        .try_import_document(requested_id.clone(), None);
+    assert_eq!(duplicate, Err(requested_id));
 }

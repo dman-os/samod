@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -15,7 +15,7 @@ use samod_core::{
             io::{HubIoAction, HubIoResult},
         },
     },
-    io::{IoResult, IoTask},
+    io::{IoResult, IoTask, IoTaskId},
     network::{ConnectionEvent, ConnectionInfo, DialerConfig, ListenerConfig, PeerDocState},
 };
 
@@ -41,6 +41,7 @@ pub struct SamodWrapper {
     announce_policy: Box<dyn Fn(DocumentId, PeerId) -> bool>,
     /// A test listener ID used for incoming connections.
     test_listener_id: Option<ListenerId>,
+    pending_hub_storage_tasks: HashSet<IoTaskId>,
 }
 
 impl SamodWrapper {
@@ -85,6 +86,7 @@ impl SamodWrapper {
             connection_events: Vec::new(),
             announce_policy: Box::new(|_, _| true),
             test_listener_id: None,
+            pending_hub_storage_tasks: HashSet::new(),
         }
     }
 
@@ -219,6 +221,42 @@ impl SamodWrapper {
         }
     }
 
+    pub fn import_document(
+        &mut self,
+        document_id: DocumentId,
+        initial_content: Option<automerge::Automerge>,
+    ) -> RunningDocIds {
+        self.try_import_document(document_id, initial_content)
+            .expect("The import document command should succeed")
+    }
+
+    pub fn try_import_document(
+        &mut self,
+        document_id: DocumentId,
+        initial_content: Option<automerge::Automerge>,
+    ) -> Result<RunningDocIds, DocumentId> {
+        let initial_content = initial_content.unwrap_or_default();
+        let DispatchedCommand { command_id, event } =
+            HubEvent::import_document(document_id.clone(), initial_content);
+        self.inbox.push_back(event);
+        self.handle_events();
+        let completed_command = self
+            .completed_commands
+            .remove(&command_id)
+            .expect("The create document command never completed");
+        match completed_command {
+            CommandResult::ImportDocument {
+                document_id,
+                actor_id,
+            } => Ok(RunningDocIds {
+                doc_id: document_id,
+                actor_id,
+            }),
+            CommandResult::ImportDocumentAlreadyExists { document_id } => Err(document_id),
+            _ => panic!("Expected an ImportDocument command result, but got {completed_command:?}"),
+        }
+    }
+
     pub fn start_create_document(&mut self) -> CommandId {
         let DispatchedCommand { command_id, event } = HubEvent::create_document(Automerge::new());
         self.inbox.push_back(event);
@@ -271,6 +309,7 @@ impl SamodWrapper {
     }
 
     pub fn handle_events(&mut self) {
+        self.handle_completed_storage_tasks();
         for (actor_id, runner) in &mut self.document_actors {
             runner.handle_events(self.now, &mut self.storage, &self.announce_policy);
             self.inbox.extend(
@@ -281,6 +320,7 @@ impl SamodWrapper {
             );
         }
         while let Some(event) = self.inbox.pop_front() {
+            self.handle_completed_storage_tasks();
             self.now += Duration::from_millis(10);
             let mut rng = rand::rng();
             let results = self.hub.handle_event(&mut rng, self.now, event);
@@ -344,25 +384,54 @@ impl SamodWrapper {
                 self.document_actors.remove(&actor_id);
             }
         }
+        self.handle_completed_storage_tasks();
     }
 
     fn execute_io_tasks(&mut self, new_tasks: Vec<IoTask<HubIoAction>>) {
         for new_task in new_tasks {
+            let task_id = new_task.task_id;
             let result = match new_task.action {
                 HubIoAction::Send { connection_id, msg } => {
                     self.outbox.entry(connection_id).or_default().push_back(msg);
-                    HubIoResult::Send
+                    Some(HubIoResult::Send)
                 }
                 HubIoAction::Disconnect { connection_id: _ } => {
                     // TODO: actually implement disconnection
-                    HubIoResult::Disconnect
+                    Some(HubIoResult::Disconnect)
+                }
+                HubIoAction::Storage { task } => {
+                    self.storage.handle_task(task_id, task);
+                    self.pending_hub_storage_tasks.insert(task_id);
+                    self.storage
+                        .check_pending_task(task_id)
+                        .map(HubIoResult::Storage)
                 }
             };
-            let task_result = IoResult {
-                task_id: new_task.task_id,
-                payload: result,
+            if let Some(result) = result {
+                self.pending_hub_storage_tasks.remove(&task_id);
+                let task_result = IoResult {
+                    task_id,
+                    payload: result,
+                };
+                self.inbox.push_back(HubEvent::io_complete(task_result));
+            }
+        }
+    }
+
+    fn handle_completed_storage_tasks(&mut self) {
+        let mut completed = Vec::new();
+        self.pending_hub_storage_tasks.retain(|task_id| {
+            let Some(storage_result) = self.storage.check_pending_task(*task_id) else {
+                return true;
             };
-            self.inbox.push_back(HubEvent::io_complete(task_result));
+            completed.push((*task_id, storage_result));
+            false
+        });
+        for (task_id, storage_result) in completed {
+            self.inbox.push_back(HubEvent::io_complete(IoResult {
+                task_id,
+                payload: HubIoResult::Storage(storage_result),
+            }));
         }
     }
 

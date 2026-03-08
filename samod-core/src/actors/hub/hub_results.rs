@@ -98,10 +98,7 @@ impl HubResults {
 
     pub(crate) fn emit_io_action(&mut self, action: HubIoAction) -> IoTaskId {
         let task_id = IoTaskId::new();
-        self.new_tasks.push(IoTask {
-            task_id: IoTaskId::new(),
-            action,
-        });
+        self.new_tasks.push(IoTask { task_id, action });
         task_id
     }
 
