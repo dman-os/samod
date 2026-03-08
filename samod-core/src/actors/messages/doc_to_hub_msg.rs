@@ -20,6 +20,16 @@ pub(crate) enum DocToHubMsgPayload {
     PeerStatesChanged {
         new_states: HashMap<ConnectionId, PeerDocState>,
     },
+    /// Announce policy resolved to allow this connection to receive updates
+    /// for this document, so hub retention should include a remote pin.
+    RemotePinAcquired {
+        connection_id: ConnectionId,
+    },
+    /// Connection is no longer receiving updates for this document, so the
+    /// corresponding remote retention pin can be released.
+    RemotePinReleased {
+        connection_id: ConnectionId,
+    },
 
     SendSyncMessage {
         connection_id: ConnectionId,

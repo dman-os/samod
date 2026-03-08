@@ -1,5 +1,8 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+};
 
 use crate::{
     ConnectionId, DialerId, DocumentActorId, DocumentId, ListenerId, PeerId, StorageId,
@@ -62,6 +65,8 @@ pub(crate) struct State {
     /// Cached dialer states last broadcast to document actors, used for
     /// change detection so we only send updates when something changed.
     last_dialer_states: HashMap<DialerId, DocDialerState>,
+    /// Actors that may become evictable, keyed by deadline.
+    eviction_queue: BinaryHeap<Reverse<(UnixTimestamp, DocumentActorId, u64)>>,
 }
 
 const LOCAL_EVICTION_GRACE: Duration = Duration::from_secs(1);
@@ -84,6 +89,7 @@ impl State {
             dialers: HashMap::new(),
             listeners: HashMap::new(),
             last_dialer_states: HashMap::new(),
+            eviction_queue: BinaryHeap::new(),
         }
     }
 
@@ -272,6 +278,7 @@ impl State {
 
     pub(crate) fn update_document_status(
         &mut self,
+        now: UnixTimestamp,
         actor_id: DocumentActorId,
         new_status: DocumentStatus,
     ) {
@@ -295,6 +302,7 @@ impl State {
             }
             _ => {}
         }
+        self.schedule_eviction_if_unpinned(actor_id, now);
     }
 
     fn handle_local_handles_acquired(&mut self, document_id: DocumentId, generation: u64) {
@@ -302,14 +310,15 @@ impl State {
             tracing::debug!(%document_id, generation, "local handle acquire for unknown document");
             return;
         };
-        let Some(actor_info) = self.actors.get_mut(&actor_id) else {
-            tracing::warn!(?actor_id, %document_id, "actor missing for local handle acquire");
-            return;
-        };
-        actor_info.has_local_handles = true;
-        actor_info.local_handle_generation = generation;
-        actor_info.last_local_handle_drop_at = None;
-        actor_info.eviction_requested = false;
+        {
+            let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+                tracing::warn!(?actor_id, %document_id, "actor missing for local handle acquire");
+                return;
+            };
+            actor_info.has_local_handles = true;
+            actor_info.local_handle_generation = generation;
+        }
+        self.clear_eviction(actor_id);
     }
 
     fn handle_local_handles_dropped(
@@ -322,21 +331,62 @@ impl State {
             tracing::debug!(%document_id, generation, "local handle drop for unknown document");
             return;
         };
-        let Some(actor_info) = self.actors.get_mut(&actor_id) else {
-            tracing::warn!(?actor_id, %document_id, "actor missing for local handle drop");
-            return;
-        };
-        if actor_info.local_handle_generation != generation {
-            tracing::trace!(
-                %document_id,
-                generation,
-                current_generation = actor_info.local_handle_generation,
-                "ignoring stale local handle drop notification"
-            );
-            return;
+        {
+            let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+                tracing::warn!(?actor_id, %document_id, "actor missing for local handle drop");
+                return;
+            };
+            if actor_info.local_handle_generation != generation {
+                tracing::trace!(
+                    %document_id,
+                    generation,
+                    current_generation = actor_info.local_handle_generation,
+                    "ignoring stale local handle drop notification"
+                );
+                return;
+            }
+            actor_info.has_local_handles = false;
         }
-        actor_info.has_local_handles = false;
-        actor_info.last_local_handle_drop_at = Some(now);
+        self.schedule_eviction_if_unpinned(actor_id, now);
+    }
+
+    fn handle_remote_pin_acquired(
+        &mut self,
+        actor_id: DocumentActorId,
+        connection_id: ConnectionId,
+    ) {
+        {
+            let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+                tracing::warn!(
+                    ?actor_id,
+                    ?connection_id,
+                    "actor missing for remote pin acquire"
+                );
+                return;
+            };
+            actor_info.remote_pins.insert(connection_id);
+        }
+        self.clear_eviction(actor_id);
+    }
+
+    fn handle_remote_pin_released(
+        &mut self,
+        now: UnixTimestamp,
+        actor_id: DocumentActorId,
+        connection_id: ConnectionId,
+    ) {
+        {
+            let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+                tracing::warn!(
+                    ?actor_id,
+                    ?connection_id,
+                    "actor missing for remote pin release"
+                );
+                return;
+            };
+            actor_info.remote_pins.remove(&connection_id);
+        }
+        self.schedule_eviction_if_unpinned(actor_id, now);
     }
 
     pub(crate) fn ensure_connections(&mut self) -> Vec<(DocumentActorId, ConnectionId, PeerId)> {
@@ -389,19 +439,6 @@ impl State {
         }
     }
 
-    fn has_established_connection_subscription(&self, document_id: &DocumentId) -> bool {
-        self.connections.values().any(|connection| {
-            connection
-                .established_connection()
-                .map(|established| {
-                    established
-                        .document_subscriptions()
-                        .contains_key(document_id)
-                })
-                .unwrap_or(false)
-        })
-    }
-
     fn remove_document_actor(&mut self, actor_id: DocumentActorId) {
         let Some(actor_info) = self.actors.remove(&actor_id) else {
             return;
@@ -416,33 +453,57 @@ impl State {
 
     fn maybe_evict_idle_actors(&mut self, now: UnixTimestamp, results: &mut HubResults) {
         let mut to_terminate = Vec::new();
-        let candidates = self
-            .actors
-            .values()
-            .filter_map(|actor_info| {
-                if actor_info.has_local_handles || actor_info.eviction_requested {
-                    return None;
-                }
-                let dropped_at = actor_info.last_local_handle_drop_at?;
-                if now - dropped_at < LOCAL_EVICTION_GRACE {
-                    return None;
-                }
-                if self.has_established_connection_subscription(&actor_info.document_id) {
-                    return None;
-                }
-                Some(actor_info.actor_id)
-            })
-            .collect::<Vec<_>>();
-        for actor_id in candidates {
+        while let Some(Reverse((deadline, actor_id, generation))) =
+            self.eviction_queue.peek().copied()
+        {
+            if deadline > now {
+                break;
+            }
+            self.eviction_queue.pop();
             let Some(actor_info) = self.actors.get_mut(&actor_id) else {
                 continue;
             };
+            if actor_info.eviction_generation != generation {
+                continue;
+            }
+            if actor_info.pending_eviction_deadline != Some(deadline) {
+                continue;
+            }
+            if actor_info.has_local_handles || !actor_info.remote_pins.is_empty() {
+                continue;
+            }
+            actor_info.pending_eviction_deadline = None;
             actor_info.eviction_requested = true;
             to_terminate.push(actor_id);
         }
         for actor_id in to_terminate {
             results.send_to_doc_actor(actor_id, HubToDocMsgPayload::Terminate);
         }
+    }
+
+    fn clear_eviction(&mut self, actor_id: DocumentActorId) {
+        let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+        actor_info.eviction_generation = actor_info.eviction_generation.wrapping_add(1);
+        actor_info.pending_eviction_deadline = None;
+        actor_info.eviction_requested = false;
+    }
+
+    fn schedule_eviction_if_unpinned(&mut self, actor_id: DocumentActorId, now: UnixTimestamp) {
+        let Some(actor_info) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+        if actor_info.has_local_handles || !actor_info.remote_pins.is_empty() {
+            return;
+        }
+        let generation = actor_info.eviction_generation.wrapping_add(1);
+        let deadline = now + LOCAL_EVICTION_GRACE;
+        actor_info.eviction_generation = generation;
+        actor_info.pending_eviction_deadline = Some(deadline);
+        actor_info.eviction_requested = false;
+        self.eviction_queue
+            .push(Reverse((deadline, actor_id, generation)));
     }
 
     pub(crate) fn pop_closed_connections(&mut self) -> Vec<ConnectionId> {
@@ -537,7 +598,7 @@ impl State {
                     }
                     HubInput::ActorMessage { actor_id, message } => match message {
                         DocToHubMsgPayload::DocumentStatusChanged { new_status } => {
-                            self.update_document_status(actor_id, new_status);
+                            self.update_document_status(now, actor_id, new_status);
                         }
                         DocToHubMsgPayload::SendSyncMessage {
                             document_id,
@@ -564,6 +625,12 @@ impl State {
                         }
                         DocToHubMsgPayload::PeerStatesChanged { new_states } => {
                             self.update_peer_states(actor_id, new_states);
+                        }
+                        DocToHubMsgPayload::RemotePinAcquired { connection_id } => {
+                            self.handle_remote_pin_acquired(actor_id, connection_id);
+                        }
+                        DocToHubMsgPayload::RemotePinReleased { connection_id } => {
+                            self.handle_remote_pin_released(now, actor_id, connection_id);
                         }
                         DocToHubMsgPayload::Broadcast { connections, msg } => {
                             self.broadcast(results, actor_id, connections, msg);
