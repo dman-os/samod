@@ -343,6 +343,8 @@ pub use peer_connection_info::{ConnectionInfo, ConnectionState, PeerDocState};
 pub use peer_info::PeerInfo;
 mod stopped;
 pub use stopped::Stopped;
+mod import_error;
+pub use import_error::ImportError;
 pub mod storage;
 pub mod transport;
 pub use crate::announce_policy::{
@@ -520,6 +522,45 @@ impl Repo {
                 }
             },
             Err(_) => Err(Stopped),
+        }
+    }
+
+    /// Import a document with an explicit ID.
+    ///
+    /// This reuses the normal create/persist path, but preserves the caller-provided
+    /// document ID instead of generating a new one.
+    pub async fn import(
+        &self,
+        document_id: DocumentId,
+        initial_content: Automerge,
+    ) -> Result<DocHandle, ImportError> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let DispatchedCommand { command_id, event } =
+                HubEvent::import_document(document_id.clone(), initial_content);
+            let mut inner = self.inner.lock().unwrap();
+            inner.handle_event(event);
+            inner.pending_commands.insert(command_id, tx);
+            drop(inner);
+        }
+        let inner = self.inner.clone();
+        match rx.await {
+            Ok(r) => match r {
+                CommandResult::ImportDocument {
+                    actor_id,
+                    document_id,
+                } => {
+                    let mut inner = inner.lock().unwrap();
+                    Ok(inner.acquire_doc_handle(actor_id, document_id))
+                }
+                CommandResult::ImportDocumentAlreadyExists { document_id } => {
+                    Err(ImportError::AlreadyExists { document_id })
+                }
+                other => {
+                    panic!("unexpected command result for import: {other:?}");
+                }
+            },
+            Err(_) => Err(ImportError::Stopped),
         }
     }
 
@@ -958,6 +999,7 @@ impl Inner {
         }
 
         for task in new_tasks {
+            let task_id = task.task_id;
             match task.action {
                 HubIoAction::Send { connection_id, msg } => {
                     if let Some(connhandle) = self.connections.get(&connection_id) {
@@ -975,6 +1017,20 @@ impl Inner {
                             "Tried to disconnect unknown connection: {:?}",
                             connection_id
                         );
+                    }
+                }
+                HubIoAction::Storage { task: storage_task } => {
+                    if self
+                        .tx_io
+                        .unbounded_send(IoLoopTask::HubStorage {
+                            task: samod_core::io::IoTask {
+                                task_id,
+                                action: storage_task,
+                            },
+                        })
+                        .is_err()
+                    {
+                        tracing::error!("IO loop channel closed, cannot dispatch hub storage task");
                     }
                 }
             }

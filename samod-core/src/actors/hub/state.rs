@@ -19,6 +19,7 @@ use crate::{
         messages::{Broadcast, DocDialerState, DocMessage, DocToHubMsgPayload, HubToDocMsgPayload},
     },
     ephemera::{EphemeralMessage, EphemeralSession, OutgoingSessionDetails},
+    io::{IoTaskId, StorageResult},
     network::{
         ConnDirection, ConnectionEvent, ConnectionInfo, ConnectionOwner, ConnectionState,
         DialRequest, DialerEvent, PeerDocState, PeerInfo, PeerMetadata,
@@ -32,6 +33,7 @@ use automerge::Automerge;
 
 use super::{CommandId, CommandResult, RunState, connection::Connection};
 mod pending_commands;
+use pending_commands::{ImportIoOutcome, import_storage_tasks};
 
 pub(crate) struct State {
     /// The storage ID that identifies this peer's storage layer.
@@ -291,7 +293,7 @@ impl State {
         match new_status {
             DocumentStatus::Ready => {
                 self.pending_commands
-                    .resolve_pending_create(actor_id, &doc_id);
+                    .resolve_pending_ready(actor_id, &doc_id);
                 self.pending_commands
                     .resolve_pending_find(&doc_id, actor_id, true);
             }
@@ -561,6 +563,9 @@ impl State {
                     HubIoResult::Send | HubIoResult::Disconnect => {
                         // Nothing to do here
                     }
+                    HubIoResult::Storage(result) => {
+                        self.handle_hub_storage_complete(results, io_completion.task_id, result);
+                    }
                 }
             }
             HubEventPayload::Input(input) => {
@@ -782,6 +787,13 @@ impl State {
                 self.handle_create_document(rng, out, command_id, *content);
                 None
             }
+            Command::ImportDocument {
+                document_id,
+                content,
+            } => {
+                self.handle_import_document(out, command_id, document_id, *content);
+                None
+            }
             Command::FindDocument { document_id } => {
                 self.handle_find_document(out, command_id, document_id)
             }
@@ -937,7 +949,6 @@ impl State {
         command_id: CommandId,
         init_doc: Automerge,
     ) {
-        // Generate new document ID
         let document_id = DocumentId::new(rng);
 
         tracing::debug!(%document_id, "creating new document");
@@ -946,6 +957,82 @@ impl State {
 
         // Queue command for completion when actor reports ready
         self.add_pending_create_command(actor_id, command_id);
+    }
+
+    #[tracing::instrument(skip(self, out, init_doc), fields(command_id = %command_id, document_id = %document_id))]
+    fn handle_import_document(
+        &mut self,
+        out: &mut HubResults,
+        command_id: CommandId,
+        document_id: DocumentId,
+        init_doc: Automerge,
+    ) {
+        if self.find_actor_for_document(&document_id).is_some() {
+            self.pending_commands
+                .complete_single_import_already_exists(command_id, document_id);
+            return;
+        }
+
+        if self
+            .pending_commands
+            .add_pending_import_command(&document_id, command_id)
+        {
+            return;
+        }
+
+        let [snapshot_task, incremental_task] = import_storage_tasks(&document_id);
+        let snapshot_task_id = out.emit_io_action(HubIoAction::Storage {
+            task: snapshot_task,
+        });
+        let incremental_task_id = out.emit_io_action(HubIoAction::Storage {
+            task: incremental_task,
+        });
+
+        self.pending_commands.start_pending_import_check(
+            document_id,
+            command_id,
+            init_doc,
+            snapshot_task_id,
+            incremental_task_id,
+        );
+    }
+
+    fn handle_hub_storage_complete(
+        &mut self,
+        out: &mut HubResults,
+        task_id: IoTaskId,
+        result: StorageResult,
+    ) {
+        let Some(outcome) = self
+            .pending_commands
+            .handle_import_storage_result(task_id, result)
+        else {
+            tracing::warn!(?task_id, "unknown hub storage io completion");
+            return;
+        };
+
+        match outcome {
+            ImportIoOutcome::Pending => {}
+            ImportIoOutcome::Occupied {
+                document_id,
+                command_ids,
+            } => {
+                self.pending_commands
+                    .complete_import_already_exists(command_ids, document_id);
+            }
+            ImportIoOutcome::Ready(ready) => {
+                if self.find_actor_for_document(&ready.document_id).is_some() {
+                    self.pending_commands
+                        .complete_import_already_exists(ready.command_ids, ready.document_id);
+                    return;
+                }
+
+                let actor_id =
+                    self.spawn_actor(out, ready.document_id.clone(), Some(ready.content), None);
+                self.pending_commands
+                    .add_pending_import_ready_commands(actor_id, ready.command_ids);
+            }
+        }
     }
 
     #[tracing::instrument(skip(self, out), fields(document_id = %document_id))]

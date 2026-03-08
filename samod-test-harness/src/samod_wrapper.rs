@@ -219,6 +219,42 @@ impl SamodWrapper {
         }
     }
 
+    pub fn import_document(
+        &mut self,
+        document_id: DocumentId,
+        initial_content: Option<automerge::Automerge>,
+    ) -> RunningDocIds {
+        self.try_import_document(document_id, initial_content)
+            .expect("The import document command should succeed")
+    }
+
+    pub fn try_import_document(
+        &mut self,
+        document_id: DocumentId,
+        initial_content: Option<automerge::Automerge>,
+    ) -> Result<RunningDocIds, DocumentId> {
+        let initial_content = initial_content.unwrap_or_default();
+        let DispatchedCommand { command_id, event } =
+            HubEvent::import_document(document_id.clone(), initial_content);
+        self.inbox.push_back(event);
+        self.handle_events();
+        let completed_command = self
+            .completed_commands
+            .remove(&command_id)
+            .expect("The create document command never completed");
+        match completed_command {
+            CommandResult::ImportDocument {
+                document_id,
+                actor_id,
+            } => Ok(RunningDocIds {
+                doc_id: document_id,
+                actor_id,
+            }),
+            CommandResult::ImportDocumentAlreadyExists { document_id } => Err(document_id),
+            _ => panic!("Expected an ImportDocument command result, but got {completed_command:?}"),
+        }
+    }
+
     pub fn start_create_document(&mut self) -> CommandId {
         let DispatchedCommand { command_id, event } = HubEvent::create_document(Automerge::new());
         self.inbox.push_back(event);
@@ -356,6 +392,9 @@ impl SamodWrapper {
                 HubIoAction::Disconnect { connection_id: _ } => {
                     // TODO: actually implement disconnection
                     HubIoResult::Disconnect
+                }
+                HubIoAction::Storage { task } => {
+                    HubIoResult::Storage(self.storage.handle_task(task))
                 }
             };
             let task_result = IoResult {

@@ -88,6 +88,20 @@ impl HubEvent {
         })
     }
 
+    /// Creates a command to import a document with an explicit document ID.
+    pub fn import_document(
+        document_id: DocumentId,
+        mut initial_content: Automerge,
+    ) -> DispatchedCommand {
+        if initial_content.is_empty() {
+            initial_content.empty_commit(CommitOptions::default());
+        }
+        Self::dispatch_command(Command::ImportDocument {
+            document_id,
+            content: Box::new(initial_content),
+        })
+    }
+
     /// Creates a command to find and load an existing document.
     pub fn find_document(document_id: DocumentId) -> DispatchedCommand {
         Self::dispatch_command(Command::FindDocument { document_id })
@@ -213,6 +227,7 @@ impl HubEvent {
             HubEventPayload::IoComplete(io_completion) => match &io_completion.payload {
                 HubIoResult::Send => "io_complete_send",
                 HubIoResult::Disconnect => "io_complete_disconnect",
+                HubIoResult::Storage(_) => "io_complete_storage",
             },
             HubEventPayload::Input(input) => match input {
                 HubInput::Stop => "stop",
@@ -220,6 +235,7 @@ impl HubEvent {
                     Command::Receive { .. } => "receive",
                     Command::ActorReady { .. } => "actor_ready",
                     Command::CreateDocument { .. } => "create_document",
+                    Command::ImportDocument { .. } => "import_document",
                     Command::FindDocument { .. } => "find_document",
                 },
                 HubInput::Tick => "tick",
