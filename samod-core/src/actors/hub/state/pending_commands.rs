@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 
-use automerge::Automerge;
-
 use crate::{
-    DocumentActorId, DocumentId, StorageKey,
+    DocumentActorId, DocumentId,
     actors::hub::{CommandId, CommandResult},
-    io::{IoTaskId, StorageResult, StorageTask},
 };
 
 #[derive(Clone, Copy)]
@@ -14,34 +11,9 @@ enum PendingReadyKind {
     Import,
 }
 
-struct PendingImportCheck {
-    command_ids: Vec<CommandId>,
-    content: Automerge,
-    snapshot_task_id: IoTaskId,
-    incremental_task_id: IoTaskId,
-    snapshot_occupied: Option<bool>,
-    incremental_occupied: Option<bool>,
-}
-
-pub(super) struct ImportReady {
-    pub(super) document_id: DocumentId,
-    pub(super) content: Automerge,
-    pub(super) command_ids: Vec<CommandId>,
-}
-
-pub(super) enum ImportIoOutcome {
-    Pending,
-    Occupied {
-        document_id: DocumentId,
-        command_ids: Vec<CommandId>,
-    },
-    Ready(ImportReady),
-}
-
 pub(super) struct PendingCommands {
     pending_find_commands: HashMap<DocumentId, Vec<CommandId>>,
     pending_ready_commands: HashMap<DocumentActorId, Vec<(CommandId, PendingReadyKind)>>,
-    pending_import_checks: HashMap<DocumentId, PendingImportCheck>,
     completed_commands: Vec<(CommandId, CommandResult)>,
 }
 
@@ -50,7 +22,6 @@ impl PendingCommands {
         Self {
             pending_find_commands: HashMap::new(),
             pending_ready_commands: HashMap::new(),
-            pending_import_checks: HashMap::new(),
             completed_commands: Vec::new(),
         }
     }
@@ -130,94 +101,6 @@ impl PendingCommands {
         self.pending_ready_commands.contains_key(&doc_actor_id)
     }
 
-    pub(super) fn start_pending_import_check(
-        &mut self,
-        document_id: DocumentId,
-        command_id: CommandId,
-        content: Automerge,
-        snapshot_task_id: IoTaskId,
-        incremental_task_id: IoTaskId,
-    ) {
-        self.pending_import_checks.insert(
-            document_id,
-            PendingImportCheck {
-                command_ids: vec![command_id],
-                content,
-                snapshot_task_id,
-                incremental_task_id,
-                snapshot_occupied: None,
-                incremental_occupied: None,
-            },
-        );
-    }
-
-    pub(super) fn add_pending_import_command(
-        &mut self,
-        document_id: &DocumentId,
-        command_id: CommandId,
-    ) -> bool {
-        if let Some(check) = self.pending_import_checks.get_mut(document_id) {
-            check.command_ids.push(command_id);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(super) fn handle_import_storage_result(
-        &mut self,
-        task_id: IoTaskId,
-        result: StorageResult,
-    ) -> Option<ImportIoOutcome> {
-        let (document_id, occupied) =
-            self.pending_import_checks
-                .iter_mut()
-                .find_map(|(document_id, check)| {
-                    let StorageResult::LoadRange { ref values } = result else {
-                        return None;
-                    };
-
-                    if check.snapshot_task_id == task_id {
-                        check.snapshot_occupied = Some(!values.is_empty());
-                        Some((document_id.clone(), !values.is_empty()))
-                    } else if check.incremental_task_id == task_id {
-                        check.incremental_occupied = Some(!values.is_empty());
-                        Some((document_id.clone(), !values.is_empty()))
-                    } else {
-                        None
-                    }
-                })?;
-
-        let check = self
-            .pending_import_checks
-            .get(&document_id)
-            .expect("pending import check must exist");
-
-        let (Some(snapshot_occupied), Some(incremental_occupied)) =
-            (check.snapshot_occupied, check.incremental_occupied)
-        else {
-            return Some(ImportIoOutcome::Pending);
-        };
-
-        let check = self
-            .pending_import_checks
-            .remove(&document_id)
-            .expect("pending import check must exist");
-
-        if snapshot_occupied || incremental_occupied || occupied {
-            Some(ImportIoOutcome::Occupied {
-                document_id,
-                command_ids: check.command_ids,
-            })
-        } else {
-            Some(ImportIoOutcome::Ready(ImportReady {
-                document_id,
-                content: check.content,
-                command_ids: check.command_ids,
-            }))
-        }
-    }
-
     pub(super) fn complete_import_already_exists(
         &mut self,
         command_ids: Vec<CommandId>,
@@ -247,15 +130,4 @@ impl PendingCommands {
     pub(super) fn pop_completed_commands(&mut self) -> Vec<(CommandId, CommandResult)> {
         std::mem::take(&mut self.completed_commands)
     }
-}
-
-pub(super) fn import_storage_tasks(document_id: &DocumentId) -> [StorageTask; 2] {
-    [
-        StorageTask::LoadRange {
-            prefix: StorageKey::snapshot_prefix(document_id),
-        },
-        StorageTask::LoadRange {
-            prefix: StorageKey::incremental_prefix(document_id),
-        },
-    ]
 }
