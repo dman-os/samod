@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     time::Duration,
 };
 
@@ -14,12 +14,15 @@ use samod_core::{
             DispatchedCommand, HubEvent,
             io::{HubIoAction, HubIoResult},
         },
+        local_repo::LocalRepoActorId,
     },
-    io::{IoResult, IoTask, IoTaskId},
+    io::{IoResult, IoTask},
     network::{ConnectionEvent, ConnectionInfo, DialerConfig, ListenerConfig, PeerDocState},
 };
 
-use crate::{Storage, doc_actor_runner::DocActorRunner};
+use crate::{
+    Storage, doc_actor_runner::DocActorRunner, local_repo_actor_runner::LocalRepoActorRunner,
+};
 
 use super::running_doc_ids::RunningDocIds;
 
@@ -36,12 +39,12 @@ pub struct SamodWrapper {
     pub(super) outbox: HashMap<ConnectionId, VecDeque<Vec<u8>>>,
     // Document actors managed by this wrapper
     document_actors: HashMap<DocumentActorId, DocActorRunner>,
+    local_repo_actors: HashMap<LocalRepoActorId, LocalRepoActorRunner>,
     // Connection events captured during event processing
     connection_events: Vec<ConnectionEvent>,
     announce_policy: Box<dyn Fn(DocumentId, PeerId) -> bool>,
     /// A test listener ID used for incoming connections.
     test_listener_id: Option<ListenerId>,
-    pending_hub_storage_tasks: HashSet<IoTaskId>,
 }
 
 impl SamodWrapper {
@@ -75,7 +78,7 @@ impl SamodWrapper {
             }
         };
 
-        SamodWrapper {
+        let mut wrapper = SamodWrapper {
             hub: *hub,
             storage,
             inbox: VecDeque::new(),
@@ -83,11 +86,16 @@ impl SamodWrapper {
             now,
             outbox: HashMap::new(),
             document_actors: HashMap::new(),
+            local_repo_actors: HashMap::new(),
             connection_events: Vec::new(),
             announce_policy: Box::new(|_, _| true),
             test_listener_id: None,
-            pending_hub_storage_tasks: HashSet::new(),
-        }
+        };
+        wrapper
+            .inbox
+            .push_back(HubEvent::configure_local_repo_actors(1));
+        wrapper.handle_events();
+        wrapper
     }
 
     pub fn pause_storage(&mut self) {
@@ -309,7 +317,6 @@ impl SamodWrapper {
     }
 
     pub fn handle_events(&mut self) {
-        self.handle_completed_storage_tasks();
         for (actor_id, runner) in &mut self.document_actors {
             runner.handle_events(self.now, &mut self.storage, &self.announce_policy);
             self.inbox.extend(
@@ -319,8 +326,16 @@ impl SamodWrapper {
                     .map(|msg| HubEvent::actor_message(*actor_id, msg)),
             );
         }
+        for (actor_id, runner) in &mut self.local_repo_actors {
+            runner.handle_events(&mut self.storage);
+            self.inbox.extend(
+                runner
+                    .take_outbox()
+                    .into_iter()
+                    .map(|msg| HubEvent::local_repo_actor_message(*actor_id, msg)),
+            );
+        }
         while let Some(event) = self.inbox.pop_front() {
-            self.handle_completed_storage_tasks();
             self.now += Duration::from_millis(10);
             let mut rng = rand::rng();
             let results = self.hub.handle_event(&mut rng, self.now, event);
@@ -358,11 +373,23 @@ impl SamodWrapper {
                 self.document_actors.insert(actor_id, actor);
             }
 
+            for args in results.spawn_local_repo_actors {
+                let actor_id = args.actor_id();
+                let actor = LocalRepoActorRunner::new(args);
+                self.local_repo_actors.insert(actor_id, actor);
+            }
+
             // Handle messages to document actors
             for (actor_id, message) in results.actor_messages {
                 self.document_actors
                     .get_mut(&actor_id)
                     .expect("message for missing actor")
+                    .deliver_message_to_inbox(message);
+            }
+            for (actor_id, message) in results.local_repo_actor_messages {
+                self.local_repo_actors
+                    .get_mut(&actor_id)
+                    .expect("message for missing local repo actor")
                     .deliver_message_to_inbox(message);
             }
 
@@ -383,55 +410,44 @@ impl SamodWrapper {
             for actor_id in stopped {
                 self.document_actors.remove(&actor_id);
             }
-        }
-        self.handle_completed_storage_tasks();
-    }
 
-    fn execute_io_tasks(&mut self, new_tasks: Vec<IoTask<HubIoAction>>) {
-        for new_task in new_tasks {
-            let task_id = new_task.task_id;
-            let result = match new_task.action {
-                HubIoAction::Send { connection_id, msg } => {
-                    self.outbox.entry(connection_id).or_default().push_back(msg);
-                    Some(HubIoResult::Send)
+            let mut stopped = Vec::new();
+            for (actor_id, runner) in &mut self.local_repo_actors {
+                runner.handle_events(&mut self.storage);
+                self.inbox.extend(
+                    runner
+                        .take_outbox()
+                        .into_iter()
+                        .map(|msg| HubEvent::local_repo_actor_message(*actor_id, msg)),
+                );
+                if runner.is_stopped() {
+                    tracing::info!(?actor_id, "removing stopped local repo actor");
+                    stopped.push(*actor_id);
                 }
-                HubIoAction::Disconnect { connection_id: _ } => {
-                    // TODO: actually implement disconnection
-                    Some(HubIoResult::Disconnect)
-                }
-                HubIoAction::Storage { task } => {
-                    self.storage.handle_task(task_id, task);
-                    self.pending_hub_storage_tasks.insert(task_id);
-                    self.storage
-                        .check_pending_task(task_id)
-                        .map(HubIoResult::Storage)
-                }
-            };
-            if let Some(result) = result {
-                self.pending_hub_storage_tasks.remove(&task_id);
-                let task_result = IoResult {
-                    task_id,
-                    payload: result,
-                };
-                self.inbox.push_back(HubEvent::io_complete(task_result));
+            }
+            for actor_id in stopped {
+                self.local_repo_actors.remove(&actor_id);
             }
         }
     }
 
-    fn handle_completed_storage_tasks(&mut self) {
-        let mut completed = Vec::new();
-        self.pending_hub_storage_tasks.retain(|task_id| {
-            let Some(storage_result) = self.storage.check_pending_task(*task_id) else {
-                return true;
+    fn execute_io_tasks(&mut self, new_tasks: Vec<IoTask<HubIoAction>>) {
+        for new_task in new_tasks {
+            let result = match new_task.action {
+                HubIoAction::Send { connection_id, msg } => {
+                    self.outbox.entry(connection_id).or_default().push_back(msg);
+                    HubIoResult::Send
+                }
+                HubIoAction::Disconnect { connection_id: _ } => {
+                    // TODO: actually implement disconnection
+                    HubIoResult::Disconnect
+                }
             };
-            completed.push((*task_id, storage_result));
-            false
-        });
-        for (task_id, storage_result) in completed {
-            self.inbox.push_back(HubEvent::io_complete(IoResult {
-                task_id,
-                payload: HubIoResult::Storage(storage_result),
-            }));
+            let task_result = IoResult {
+                task_id: new_task.task_id,
+                payload: result,
+            };
+            self.inbox.push_back(HubEvent::io_complete(task_result));
         }
     }
 

@@ -8,7 +8,8 @@ use samod_core::{
     DialerId, DocumentActorId, DocumentId, PeerId,
     actors::{
         document::io::{DocumentIoResult, DocumentIoTask},
-        hub::{CommandResult, DispatchedCommand, HubEvent, io::HubIoResult},
+        hub::{CommandResult, DispatchedCommand, HubEvent},
+        local_repo::{LocalRepoActorId, io::LocalRepoIoResult},
     },
     io::{IoResult, IoTask, StorageResult, StorageTask},
 };
@@ -33,8 +34,9 @@ pub(crate) enum IoLoopTask {
         task: IoTask<DocumentIoTask>,
         actor_id: DocumentActorId,
     },
-    HubStorage {
+    LocalRepoStorage {
         task: IoTask<StorageTask>,
+        actor_id: LocalRepoActorId,
     },
     EstablishTransport {
         dialer_id: DialerId,
@@ -64,8 +66,9 @@ struct StorageTaskComplete {
     actor_id: DocumentActorId,
 }
 
-struct HubStorageTaskComplete {
-    result: IoResult<HubIoResult>,
+struct LocalRepoStorageTaskComplete {
+    result: IoResult<LocalRepoIoResult>,
+    actor_id: LocalRepoActorId,
 }
 
 /// Type alias for a shared, type-erased dialer.
@@ -82,7 +85,7 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
     observer: Option<Arc<dyn RepoObserver>>,
 ) {
     let mut running_storage_tasks = FuturesUnordered::new();
-    let mut running_hub_storage_tasks = FuturesUnordered::new();
+    let mut running_local_repo_storage_tasks = FuturesUnordered::new();
     let mut running_connections = FuturesUnordered::new();
     let mut running_transport_establishments = FuturesUnordered::new();
 
@@ -109,16 +112,17 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
                             }
                         });
                     },
-                    IoLoopTask::HubStorage { task } => {
-                        running_hub_storage_tasks.push({
+                    IoLoopTask::LocalRepoStorage { task, actor_id } => {
+                        running_local_repo_storage_tasks.push({
                             let storage = storage.clone();
                             async move {
                                 let task_id = task.task_id;
                                 let result = dispatch_storage_task(task.action, storage).await;
-                                HubStorageTaskComplete {
+                                LocalRepoStorageTaskComplete {
+                                    actor_id,
                                     result: IoResult {
                                         task_id,
-                                        payload: HubIoResult::Storage(result),
+                                        payload: LocalRepoIoResult::Storage(result),
                                     },
                                 }
                             }
@@ -162,8 +166,12 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
                 let inner = inner.lock().unwrap();
                 inner.dispatch_task(actor_id, ActorTask::IoComplete(result));
             },
-            result = running_hub_storage_tasks.select_next_some() => {
-                inner.lock().unwrap().handle_event(HubEvent::io_complete(result.result));
+            result = running_local_repo_storage_tasks.select_next_some() => {
+                let LocalRepoStorageTaskComplete { actor_id, result } = result;
+                inner.lock().unwrap().dispatch_local_repo_task(
+                    actor_id,
+                    crate::local_repo_actor_task::LocalRepoActorTask::IoComplete(result),
+                );
             },
             _ = running_connections.select_next_some() => {
 
@@ -178,11 +186,13 @@ pub(crate) async fn io_loop<S: LocalStorage, A: LocalAnnouncePolicy>(
         let inner = inner.lock().unwrap();
         inner.dispatch_task(actor_id, ActorTask::IoComplete(result));
     }
-    while let Some(HubStorageTaskComplete { result }) = running_hub_storage_tasks.next().await {
-        inner
-            .lock()
-            .unwrap()
-            .handle_event(HubEvent::io_complete(result));
+    while let Some(LocalRepoStorageTaskComplete { actor_id, result }) =
+        running_local_repo_storage_tasks.next().await
+    {
+        inner.lock().unwrap().dispatch_local_repo_task(
+            actor_id,
+            crate::local_repo_actor_task::LocalRepoActorTask::IoComplete(result),
+        );
     }
 }
 

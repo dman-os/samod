@@ -3,8 +3,9 @@ use automerge::{Automerge, transaction::CommitOptions};
 use crate::{
     ConnectionId, DialerId, DocumentActorId, DocumentId, ListenerId,
     actors::{
-        DocToHubMsg,
+        DocToHubMsg, LocalRepoToHubMsg,
         hub::{Command, CommandId},
+        local_repo::LocalRepoActorId,
     },
     io::IoResult,
     network::{DialerConfig, ListenerConfig},
@@ -44,6 +45,18 @@ impl HubEvent {
     pub fn actor_message(actor_id: DocumentActorId, message: DocToHubMsg) -> Self {
         HubEvent {
             payload: HubEventPayload::Input(HubInput::ActorMessage {
+                actor_id,
+                message: message.0,
+            }),
+        }
+    }
+
+    pub fn local_repo_actor_message(
+        actor_id: LocalRepoActorId,
+        message: LocalRepoToHubMsg,
+    ) -> Self {
+        HubEvent {
+            payload: HubEventPayload::Input(HubInput::LocalRepoActorMessage {
                 actor_id,
                 message: message.0,
             }),
@@ -105,6 +118,12 @@ impl HubEvent {
     /// Creates a command to find and load an existing document.
     pub fn find_document(document_id: DocumentId) -> DispatchedCommand {
         Self::dispatch_command(Command::FindDocument { document_id })
+    }
+
+    pub fn configure_local_repo_actors(count: usize) -> Self {
+        HubEvent {
+            payload: HubEventPayload::Input(HubInput::ConfigureLocalRepoActors { count }),
+        }
     }
 
     /// Creates an event indicating that a network connection has been lost externally.
@@ -227,7 +246,6 @@ impl HubEvent {
             HubEventPayload::IoComplete(io_completion) => match &io_completion.payload {
                 HubIoResult::Send => "io_complete_send",
                 HubIoResult::Disconnect => "io_complete_disconnect",
-                HubIoResult::Storage(_) => "io_complete_storage",
             },
             HubEventPayload::Input(input) => match input {
                 HubInput::Stop => "stop",
@@ -240,6 +258,7 @@ impl HubEvent {
                 },
                 HubInput::Tick => "tick",
                 HubInput::ActorMessage { .. } => "actor_message",
+                HubInput::LocalRepoActorMessage { .. } => "local_repo_actor_message",
                 HubInput::LocalHandlesAcquired { .. } => "local_handles_acquired",
                 HubInput::LocalHandlesDropped { .. } => "local_handles_dropped",
                 HubInput::ConnectionLost { .. } => "connection_lost",
@@ -250,6 +269,7 @@ impl HubEvent {
                 HubInput::DialFailed { .. } => "dial_failed",
                 HubInput::RemoveDialer { .. } => "remove_dialer",
                 HubInput::RemoveListener { .. } => "remove_listener",
+                HubInput::ConfigureLocalRepoActors { .. } => "configure_local_repo_actors",
             },
         }
     }

@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use crate::{DocumentActorId, DocumentId, actors::document::DocumentStatus};
+use crate::{
+    ConnectionId, DocumentActorId, DocumentId, UnixTimestamp,
+    actors::{document::DocumentStatus, local_repo::LocalRepoActorId},
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ActorInfo {
@@ -8,10 +11,10 @@ pub(crate) struct ActorInfo {
     pub(crate) document_id: DocumentId,
     pub(crate) status: DocumentStatus,
     pub(crate) has_local_handles: bool,
-    pub(crate) remote_pins: HashSet<crate::ConnectionId>,
+    pub(crate) remote_pins: HashSet<ConnectionId>,
     pub(crate) local_handle_generation: u64,
     pub(crate) eviction_generation: u64,
-    pub(crate) pending_eviction_deadline: Option<crate::UnixTimestamp>,
+    pub(crate) pending_eviction_deadline: Option<UnixTimestamp>,
     pub(crate) eviction_requested: bool,
 }
 
@@ -29,4 +32,9 @@ impl ActorInfo {
             eviction_requested: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalRepoActorInfo {
+    pub(crate) actor_id: LocalRepoActorId,
 }

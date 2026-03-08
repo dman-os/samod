@@ -42,6 +42,7 @@ pub struct RepoBuilder<S, R, A> {
     pub(crate) announce_policy: A,
     pub(crate) peer_id: Option<PeerId>,
     pub(crate) concurrency: ConcurrencyConfig,
+    pub(crate) local_repo_actor_count: usize,
     pub(crate) observer: Option<Arc<dyn RepoObserver>>,
 }
 
@@ -53,6 +54,7 @@ impl<S, R, A> RepoBuilder<S, R, A> {
             runtime: self.runtime,
             announce_policy: self.announce_policy,
             concurrency: self.concurrency,
+            local_repo_actor_count: self.local_repo_actor_count,
             observer: self.observer,
         }
     }
@@ -64,6 +66,7 @@ impl<S, R, A> RepoBuilder<S, R, A> {
             storage: self.storage,
             announce_policy: self.announce_policy,
             concurrency: self.concurrency,
+            local_repo_actor_count: self.local_repo_actor_count,
             observer: self.observer,
         }
     }
@@ -80,6 +83,7 @@ impl<S, R, A> RepoBuilder<S, R, A> {
             storage: self.storage,
             announce_policy,
             concurrency: self.concurrency,
+            local_repo_actor_count: self.local_repo_actor_count,
             observer: self.observer,
         }
     }
@@ -90,6 +94,11 @@ impl<S, R, A> RepoBuilder<S, R, A> {
     /// documentation
     pub fn with_concurrency(mut self, concurrency: ConcurrencyConfig) -> Self {
         self.concurrency = concurrency;
+        self
+    }
+
+    pub fn with_local_repo_actor_count(mut self, count: usize) -> Self {
+        self.local_repo_actor_count = count.max(1);
         self
     }
 
@@ -108,6 +117,7 @@ impl<R> RepoBuilder<InMemoryStorage, R, AlwaysAnnounce> {
             peer_id: None,
             announce_policy: AlwaysAnnounce,
             concurrency: ConcurrencyConfig::AsyncRuntime,
+            local_repo_actor_count: 1,
             observer: None,
         }
     }
