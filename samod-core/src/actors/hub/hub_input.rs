@@ -2,7 +2,8 @@ use crate::{
     ConnectionId, DialerId, DocumentActorId, ListenerId,
     actors::{
         hub::{Command, CommandId},
-        messages::DocToHubMsgPayload,
+        local_repo::LocalRepoActorId,
+        messages::{DocToHubMsgPayload, LocalRepoToHubMsgPayload},
     },
     network::{DialerConfig, ListenerConfig},
 };
@@ -18,6 +19,10 @@ pub(crate) enum HubInput {
     ActorMessage {
         actor_id: DocumentActorId,
         message: DocToHubMsgPayload,
+    },
+    LocalRepoActorMessage {
+        actor_id: LocalRepoActorId,
+        message: LocalRepoToHubMsgPayload,
     },
     /// Local code acquired a new handle/lease to a document actor.
     LocalHandlesAcquired {
@@ -65,6 +70,9 @@ pub(crate) enum HubInput {
     /// Remove a listener and close all its connections
     RemoveListener {
         listener_id: ListenerId,
+    },
+    ConfigureLocalRepoActors {
+        count: usize,
     },
     Stop,
 }

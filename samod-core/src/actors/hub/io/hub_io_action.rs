@@ -1,4 +1,4 @@
-use crate::{ConnectionId, io::StorageTask};
+use crate::ConnectionId;
 
 #[derive(Debug, Clone)]
 pub enum HubIoAction {
@@ -9,9 +9,5 @@ pub enum HubIoAction {
 
     Disconnect {
         connection_id: ConnectionId,
-    },
-
-    Storage {
-        task: StorageTask,
     },
 }

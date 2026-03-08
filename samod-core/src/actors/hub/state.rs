@@ -1,7 +1,8 @@
-use std::time::{Duration, Instant};
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -16,10 +17,13 @@ use crate::{
             io::{HubIoAction, HubIoResult},
             listener::ListenerState,
         },
-        messages::{Broadcast, DocDialerState, DocMessage, DocToHubMsgPayload, HubToDocMsgPayload},
+        local_repo::{LocalRepoActorId, LocalRepoRequestId, SpawnArgs as LocalRepoSpawnArgs},
+        messages::{
+            Broadcast, DocDialerState, DocMessage, DocToHubMsgPayload, HubToDocMsgPayload,
+            HubToLocalRepoMsgPayload, LocalRepoToHubMsgPayload,
+        },
     },
     ephemera::{EphemeralMessage, EphemeralSession, OutgoingSessionDetails},
-    io::{IoTaskId, StorageResult},
     network::{
         ConnDirection, ConnectionEvent, ConnectionInfo, ConnectionOwner, ConnectionState,
         DialRequest, DialerEvent, PeerDocState, PeerInfo, PeerMetadata,
@@ -28,12 +32,16 @@ use crate::{
 };
 
 mod actor_info;
-pub(crate) use actor_info::ActorInfo;
+pub(crate) use actor_info::{ActorInfo, LocalRepoActorInfo};
 use automerge::Automerge;
 
 use super::{CommandId, CommandResult, RunState, connection::Connection};
 mod pending_commands;
-use pending_commands::{ImportIoOutcome, import_storage_tasks};
+struct PendingImport {
+    command_ids: Vec<CommandId>,
+    content: Automerge,
+    request_id: LocalRepoRequestId,
+}
 
 pub(crate) struct State {
     /// The storage ID that identifies this peer's storage layer.
@@ -45,6 +53,9 @@ pub(crate) struct State {
     /// Active document actors
     actors: HashMap<DocumentActorId, ActorInfo>,
 
+    /// Active local repo actors
+    local_repo_actors: HashMap<LocalRepoActorId, LocalRepoActorInfo>,
+
     /// Connection state for each connection
     connections: HashMap<ConnectionId, Connection>,
 
@@ -53,6 +64,10 @@ pub(crate) struct State {
 
     // Commands we are currently processing
     pending_commands: pending_commands::PendingCommands,
+
+    pending_imports: HashMap<DocumentId, PendingImport>,
+
+    pending_import_requests: HashMap<LocalRepoRequestId, DocumentId>,
 
     ephemeral_session: EphemeralSession,
 
@@ -83,9 +98,12 @@ impl State {
             storage_id,
             peer_id,
             actors: HashMap::new(),
+            local_repo_actors: HashMap::new(),
             connections: HashMap::new(),
             document_to_actor: HashMap::new(),
             pending_commands: pending_commands::PendingCommands::new(),
+            pending_imports: HashMap::new(),
+            pending_import_requests: HashMap::new(),
             ephemeral_session,
             run_state: RunState::Running,
             dialers: HashMap::new(),
@@ -238,6 +256,11 @@ impl State {
         self.document_to_actor.insert(document_id, actor_id);
     }
 
+    pub(crate) fn add_local_repo_actor(&mut self, actor_id: LocalRepoActorId) {
+        self.local_repo_actors
+            .insert(actor_id, LocalRepoActorInfo { actor_id });
+    }
+
     pub(crate) fn find_actor_for_document(&self, document_id: &DocumentId) -> Option<&ActorInfo> {
         self.document_to_actor
             .get(document_id)
@@ -276,6 +299,10 @@ impl State {
 
     pub(crate) fn document_actors(&self) -> impl Iterator<Item = &ActorInfo> {
         self.actors.values()
+    }
+
+    pub(crate) fn local_repo_actors(&self) -> impl Iterator<Item = &LocalRepoActorInfo> {
+        self.local_repo_actors.values()
     }
 
     pub(crate) fn update_document_status(
@@ -389,6 +416,29 @@ impl State {
             actor_info.remote_pins.remove(&connection_id);
         }
         self.schedule_eviction_if_unpinned(actor_id, now);
+    }
+
+    fn configure_local_repo_actors(&mut self, results: &mut HubResults, count: usize) {
+        let target = count.max(1);
+        while self.local_repo_actors.len() < target {
+            let actor_id = LocalRepoActorId::new();
+            self.add_local_repo_actor(actor_id);
+            results.emit_spawn_local_repo_actor(LocalRepoSpawnArgs { actor_id });
+        }
+    }
+
+    fn local_repo_actor_for_document(&self, document_id: &DocumentId) -> Option<LocalRepoActorId> {
+        let actor_count = self.local_repo_actors.len();
+        if actor_count == 0 {
+            return None;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        document_id.to_string().hash(&mut hasher);
+        let index = (hasher.finish() as usize) % actor_count;
+        let mut actor_ids = self.local_repo_actors.keys().copied().collect::<Vec<_>>();
+        actor_ids.sort();
+        actor_ids.get(index).copied()
     }
 
     pub(crate) fn ensure_connections(&mut self) -> Vec<(DocumentActorId, ConnectionId, PeerId)> {
@@ -558,16 +608,11 @@ impl State {
         }
         let event_type = event.event_type_for_metrics();
         match event.payload {
-            HubEventPayload::IoComplete(io_completion) => {
-                match io_completion.payload {
-                    HubIoResult::Send | HubIoResult::Disconnect => {
-                        // Nothing to do here
-                    }
-                    HubIoResult::Storage(result) => {
-                        self.handle_hub_storage_complete(results, io_completion.task_id, result);
-                    }
+            HubEventPayload::IoComplete(io_completion) => match io_completion.payload {
+                HubIoResult::Send | HubIoResult::Disconnect => {
+                    // Nothing to do here
                 }
-            }
+            },
             HubEventPayload::Input(input) => {
                 match input {
                     HubInput::Stop => {
@@ -579,6 +624,12 @@ impl State {
                                 results.send_to_doc_actor(
                                     actor_info.actor_id,
                                     HubToDocMsgPayload::Terminate,
+                                );
+                            }
+                            for actor_info in self.local_repo_actors() {
+                                results.send_to_local_repo_actor(
+                                    actor_info.actor_id,
+                                    HubToLocalRepoMsgPayload::Terminate,
                                 );
                             }
                             // Close all connections, dialers, and listeners so
@@ -645,6 +696,22 @@ impl State {
                             self.remove_document_actor(actor_id);
                         }
                     },
+                    HubInput::LocalRepoActorMessage { actor_id, message } => match message {
+                        LocalRepoToHubMsgPayload::ImportPreflightComplete {
+                            request_id,
+                            document_id,
+                            occupied,
+                        } => self.handle_import_preflight_complete(
+                            results,
+                            request_id,
+                            document_id,
+                            occupied,
+                        ),
+                        LocalRepoToHubMsgPayload::Terminated => {
+                            tracing::debug!(?actor_id, "local repo actor terminated");
+                            self.local_repo_actors.remove(&actor_id);
+                        }
+                    },
                     HubInput::LocalHandlesAcquired {
                         document_id,
                         generation,
@@ -691,6 +758,9 @@ impl State {
                     }
                     HubInput::RemoveListener { listener_id } => {
                         self.handle_remove_listener(results, listener_id);
+                    }
+                    HubInput::ConfigureLocalRepoActors { count } => {
+                        self.configure_local_repo_actors(results, count);
                     }
                 }
             }
@@ -754,11 +824,15 @@ impl State {
         }
 
         if self.run_state == RunState::Stopping {
-            if self.actors.is_empty() {
+            if self.actors.is_empty() && self.local_repo_actors.is_empty() {
                 tracing::debug!("hub stopped");
                 self.run_state = RunState::Stopped;
             } else {
-                tracing::debug!(remaining_actors = self.actors.len(), "hub still stopping");
+                tracing::debug!(
+                    remaining_doc_actors = self.actors.len(),
+                    remaining_local_repo_actors = self.local_repo_actors.len(),
+                    "hub still stopping"
+                );
             }
         }
 
@@ -973,66 +1047,63 @@ impl State {
             return;
         }
 
-        if self
-            .pending_commands
-            .add_pending_import_command(&document_id, command_id)
-        {
+        if let Some(pending) = self.pending_imports.get_mut(&document_id) {
+            pending.command_ids.push(command_id);
             return;
         }
 
-        let [snapshot_task, incremental_task] = import_storage_tasks(&document_id);
-        let snapshot_task_id = out.emit_io_action(HubIoAction::Storage {
-            task: snapshot_task,
-        });
-        let incremental_task_id = out.emit_io_action(HubIoAction::Storage {
-            task: incremental_task,
-        });
-
-        self.pending_commands.start_pending_import_check(
-            document_id,
-            command_id,
-            init_doc,
-            snapshot_task_id,
-            incremental_task_id,
+        let Some(local_repo_actor_id) = self.local_repo_actor_for_document(&document_id) else {
+            panic!("import requested before local repo actors were configured");
+        };
+        let request_id = LocalRepoRequestId::new();
+        self.pending_import_requests
+            .insert(request_id, document_id.clone());
+        self.pending_imports.insert(
+            document_id.clone(),
+            PendingImport {
+                command_ids: vec![command_id],
+                content: init_doc,
+                request_id,
+            },
+        );
+        out.send_to_local_repo_actor(
+            local_repo_actor_id,
+            HubToLocalRepoMsgPayload::ImportPreflight {
+                document_id,
+                request_id,
+            },
         );
     }
 
-    fn handle_hub_storage_complete(
+    fn handle_import_preflight_complete(
         &mut self,
         out: &mut HubResults,
-        task_id: IoTaskId,
-        result: StorageResult,
+        request_id: LocalRepoRequestId,
+        document_id: DocumentId,
+        occupied: bool,
     ) {
-        let Some(outcome) = self
-            .pending_commands
-            .handle_import_storage_result(task_id, result)
-        else {
-            tracing::warn!(?task_id, "unknown hub storage io completion");
+        let Some(pending_document_id) = self.pending_import_requests.remove(&request_id) else {
+            tracing::warn!(?request_id, "unknown local repo request completion");
+            return;
+        };
+        debug_assert_eq!(pending_document_id, document_id);
+
+        let Some(pending) = self.pending_imports.remove(&document_id) else {
+            tracing::warn!(%document_id, ?request_id, "missing pending import for completion");
             return;
         };
 
-        match outcome {
-            ImportIoOutcome::Pending => {}
-            ImportIoOutcome::Occupied {
-                document_id,
-                command_ids,
-            } => {
-                self.pending_commands
-                    .complete_import_already_exists(command_ids, document_id);
-            }
-            ImportIoOutcome::Ready(ready) => {
-                if self.find_actor_for_document(&ready.document_id).is_some() {
-                    self.pending_commands
-                        .complete_import_already_exists(ready.command_ids, ready.document_id);
-                    return;
-                }
+        debug_assert_eq!(pending.request_id, request_id);
 
-                let actor_id =
-                    self.spawn_actor(out, ready.document_id.clone(), Some(ready.content), None);
-                self.pending_commands
-                    .add_pending_import_ready_commands(actor_id, ready.command_ids);
-            }
+        if occupied || self.find_actor_for_document(&document_id).is_some() {
+            self.pending_commands
+                .complete_import_already_exists(pending.command_ids, document_id);
+            return;
         }
+
+        let actor_id = self.spawn_actor(out, document_id.clone(), Some(pending.content), None);
+        self.pending_commands
+            .add_pending_import_ready_commands(actor_id, pending.command_ids);
     }
 
     #[tracing::instrument(skip(self, out), fields(document_id = %document_id))]
