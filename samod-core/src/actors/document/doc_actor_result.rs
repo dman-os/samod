@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use automerge::ChangeHash;
 
 use crate::{
-    ConnectionId, DocumentChanged, DocumentId, PeerId, StorageKey,
+    ChangeOrigin, ConnectionId, DocumentChanged, DocumentId, PeerId, StorageKey,
     actors::{
         DocToHubMsg,
         document::{DocumentStatus, SyncMessageStat, io::DocumentIoTask},
@@ -53,8 +53,17 @@ impl DocActorResult {
         self.ephemeral_messages.push(msg);
     }
 
-    pub(crate) fn emit_doc_changed(&mut self, new_heads: Vec<ChangeHash>) {
-        self.change_events.push(DocumentChanged { new_heads });
+    pub(crate) fn emit_doc_changed(
+        &mut self,
+        old_heads: Vec<ChangeHash>,
+        new_heads: Vec<ChangeHash>,
+        origin: ChangeOrigin,
+    ) {
+        self.change_events.push(DocumentChanged {
+            old_heads,
+            new_heads,
+            origin,
+        });
     }
 
     /// Send a message back to the hub

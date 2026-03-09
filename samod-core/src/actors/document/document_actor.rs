@@ -14,7 +14,10 @@ use crate::actors::messages::{Broadcast, DocDialerState, DocToHubMsgPayload};
 use crate::actors::{DocToHubMsg, HubToDocMsg, RunState};
 use crate::io::{IoResult, IoTaskId};
 use crate::network::PeerDocState;
-use crate::{ConnectionId, DocumentActorId, DocumentChanged, DocumentId, PeerId, UnixTimestamp};
+use crate::{
+    ChangeOrigin, ConnectionId, DocumentActorId, DocumentChanged, DocumentId, PeerId,
+    UnixTimestamp,
+};
 
 use super::{doc_state::DocState, errors::DocumentError};
 
@@ -604,9 +607,11 @@ impl<'a> WithDocGuard<'a> {
         if old_heads != new_heads {
             tracing::debug!(doc_id=%actor.document_id(), "document was modified in actor");
             // Notify main hub that document changed
-            actor_result
-                .change_events
-                .push(DocumentChanged { new_heads });
+            actor_result.change_events.push(DocumentChanged {
+                old_heads,
+                new_heads,
+                origin: ChangeOrigin::Local,
+            });
         }
         actor_result
     }
