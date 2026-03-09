@@ -4,7 +4,7 @@ use std::time::Duration;
 use automerge::Automerge;
 
 use crate::{
-    ConnectionId, DocumentId, StorageKey, UnixTimestamp,
+    ChangeOrigin, ConnectionId, DocumentId, StorageKey, UnixTimestamp,
     actors::{
         document::{
             DocActorResult, SyncDirection, SyncMessageStat,
@@ -81,7 +81,8 @@ impl DocState {
             PhaseTransition::ToReady => {
                 tracing::trace!("transitioning to ready");
                 out.send_doc_status_update(DocumentStatus::Ready);
-                out.emit_doc_changed(self.doc.get_heads());
+                let heads = self.doc.get_heads();
+                out.emit_doc_changed(heads.clone(), heads, ChangeOrigin::Bootstrap);
                 self.phase = Phase::Ready(Ready::new());
             }
             PhaseTransition::ToNotFound => {
@@ -276,7 +277,14 @@ impl DocState {
                 let duration = ready.receive_sync_message(now, &mut self.doc, peer_conn, msg);
                 let heads_after = self.doc.get_heads();
                 if heads_before != heads_after {
-                    out.emit_doc_changed(heads_after);
+                    out.emit_doc_changed(
+                        heads_before,
+                        heads_after,
+                        ChangeOrigin::Remote {
+                            connection_id,
+                            peer_id: peer_conn.peer_id.clone(),
+                        },
+                    );
                 }
                 (PhaseTransition::None, duration)
             }
