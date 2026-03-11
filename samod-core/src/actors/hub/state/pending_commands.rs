@@ -127,6 +127,34 @@ impl PendingCommands {
         ));
     }
 
+    pub(super) fn complete_contains_document_local(
+        &mut self,
+        command_id: CommandId,
+        document_id: DocumentId,
+        contains: bool,
+    ) {
+        self.completed_commands.push((
+            command_id,
+            CommandResult::ContainsDocumentLocal {
+                document_id,
+                contains,
+            },
+        ));
+    }
+
+    pub(super) fn complete_export_document_local(
+        &mut self,
+        command_id: CommandId,
+        document_id: DocumentId,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let result = match bytes {
+            Some(bytes) => CommandResult::ExportDocumentLocal { document_id, bytes },
+            None => CommandResult::ExportDocumentLocalNotFound { document_id },
+        };
+        self.completed_commands.push((command_id, result));
+    }
+
     pub(super) fn pop_completed_commands(&mut self) -> Vec<(CommandId, CommandResult)> {
         std::mem::take(&mut self.completed_commands)
     }

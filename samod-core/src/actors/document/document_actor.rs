@@ -15,8 +15,7 @@ use crate::actors::{DocToHubMsg, HubToDocMsg, RunState};
 use crate::io::{IoResult, IoTaskId};
 use crate::network::PeerDocState;
 use crate::{
-    ChangeOrigin, ConnectionId, DocumentActorId, DocumentChanged, DocumentId, PeerId,
-    UnixTimestamp,
+    ChangeOrigin, ConnectionId, DocumentActorId, DocumentChanged, DocumentId, PeerId, UnixTimestamp,
 };
 
 use super::{doc_state::DocState, errors::DocumentError};
@@ -519,13 +518,14 @@ impl DocumentActor {
                         connection_id: conn_id,
                     }));
             }
-        } else if old_policy == AnnouncePolicy::Announce && new_policy != AnnouncePolicy::Announce {
-            if self.remote_pinned_connections.remove(&conn_id) {
-                out.outgoing_messages
-                    .push(DocToHubMsg(DocToHubMsgPayload::RemotePinReleased {
-                        connection_id: conn_id,
-                    }));
-            }
+        } else if old_policy == AnnouncePolicy::Announce
+            && new_policy != AnnouncePolicy::Announce
+            && self.remote_pinned_connections.remove(&conn_id)
+        {
+            out.outgoing_messages
+                .push(DocToHubMsg(DocToHubMsgPayload::RemotePinReleased {
+                    connection_id: conn_id,
+                }));
         }
     }
 

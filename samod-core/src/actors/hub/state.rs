@@ -43,6 +43,16 @@ struct PendingImport {
     request_id: LocalRepoRequestId,
 }
 
+struct PendingContains {
+    command_ids: Vec<CommandId>,
+    request_id: LocalRepoRequestId,
+}
+
+struct PendingExport {
+    command_ids: Vec<CommandId>,
+    request_id: LocalRepoRequestId,
+}
+
 pub(crate) struct State {
     /// The storage ID that identifies this peer's storage layer.
     pub(crate) storage_id: StorageId,
@@ -68,6 +78,14 @@ pub(crate) struct State {
     pending_imports: HashMap<DocumentId, PendingImport>,
 
     pending_import_requests: HashMap<LocalRepoRequestId, DocumentId>,
+
+    pending_contains: HashMap<DocumentId, PendingContains>,
+
+    pending_contains_requests: HashMap<LocalRepoRequestId, DocumentId>,
+
+    pending_exports: HashMap<DocumentId, PendingExport>,
+
+    pending_export_requests: HashMap<LocalRepoRequestId, DocumentId>,
 
     ephemeral_session: EphemeralSession,
 
@@ -104,6 +122,10 @@ impl State {
             pending_commands: pending_commands::PendingCommands::new(),
             pending_imports: HashMap::new(),
             pending_import_requests: HashMap::new(),
+            pending_contains: HashMap::new(),
+            pending_contains_requests: HashMap::new(),
+            pending_exports: HashMap::new(),
+            pending_export_requests: HashMap::new(),
             ephemeral_session,
             run_state: RunState::Running,
             dialers: HashMap::new(),
@@ -707,6 +729,24 @@ impl State {
                             document_id,
                             occupied,
                         ),
+                        LocalRepoToHubMsgPayload::ContainsDocumentComplete {
+                            request_id,
+                            document_id,
+                            contains,
+                        } => {
+                            self.handle_contains_document_complete(
+                                request_id,
+                                document_id,
+                                contains,
+                            );
+                        }
+                        LocalRepoToHubMsgPayload::ExportDocumentComplete {
+                            request_id,
+                            document_id,
+                            bytes,
+                        } => {
+                            self.handle_export_document_complete(request_id, document_id, bytes);
+                        }
                         LocalRepoToHubMsgPayload::Terminated => {
                             tracing::debug!(?actor_id, "local repo actor terminated");
                             self.local_repo_actors.remove(&actor_id);
@@ -866,6 +906,13 @@ impl State {
                 content,
             } => {
                 self.handle_import_document(out, command_id, document_id, *content);
+                None
+            }
+            Command::ContainsDocumentLocal { document_id } => {
+                self.handle_contains_document_local(out, command_id, document_id)
+            }
+            Command::ExportDocumentLocal { document_id } => {
+                self.handle_export_document_local(out, command_id, document_id);
                 None
             }
             Command::FindDocument { document_id } => {
@@ -1104,6 +1151,132 @@ impl State {
         let actor_id = self.spawn_actor(out, document_id.clone(), Some(pending.content), None);
         self.pending_commands
             .add_pending_import_ready_commands(actor_id, pending.command_ids);
+    }
+
+    #[tracing::instrument(skip(self, out), fields(command_id = %command_id, document_id = %document_id))]
+    fn handle_contains_document_local(
+        &mut self,
+        out: &mut HubResults,
+        command_id: CommandId,
+        document_id: DocumentId,
+    ) -> Option<CommandResult> {
+        if self.find_actor_for_document(&document_id).is_some() {
+            return Some(CommandResult::ContainsDocumentLocal {
+                document_id,
+                contains: true,
+            });
+        }
+
+        if let Some(pending) = self.pending_contains.get_mut(&document_id) {
+            pending.command_ids.push(command_id);
+            return None;
+        }
+
+        let Some(local_repo_actor_id) = self.local_repo_actor_for_document(&document_id) else {
+            panic!("contains requested before local repo actors were configured");
+        };
+        let request_id = LocalRepoRequestId::new();
+        self.pending_contains_requests
+            .insert(request_id, document_id.clone());
+        self.pending_contains.insert(
+            document_id.clone(),
+            PendingContains {
+                command_ids: vec![command_id],
+                request_id,
+            },
+        );
+        out.send_to_local_repo_actor(
+            local_repo_actor_id,
+            HubToLocalRepoMsgPayload::ContainsDocument {
+                document_id,
+                request_id,
+            },
+        );
+        None
+    }
+
+    #[tracing::instrument(skip(self, out), fields(command_id = %command_id, document_id = %document_id))]
+    fn handle_export_document_local(
+        &mut self,
+        out: &mut HubResults,
+        command_id: CommandId,
+        document_id: DocumentId,
+    ) {
+        if let Some(pending) = self.pending_exports.get_mut(&document_id) {
+            pending.command_ids.push(command_id);
+            return;
+        }
+
+        let Some(local_repo_actor_id) = self.local_repo_actor_for_document(&document_id) else {
+            panic!("export requested before local repo actors were configured");
+        };
+        let request_id = LocalRepoRequestId::new();
+        self.pending_export_requests
+            .insert(request_id, document_id.clone());
+        self.pending_exports.insert(
+            document_id.clone(),
+            PendingExport {
+                command_ids: vec![command_id],
+                request_id,
+            },
+        );
+        out.send_to_local_repo_actor(
+            local_repo_actor_id,
+            HubToLocalRepoMsgPayload::ExportDocument {
+                document_id,
+                request_id,
+            },
+        );
+    }
+
+    fn handle_contains_document_complete(
+        &mut self,
+        request_id: LocalRepoRequestId,
+        document_id: DocumentId,
+        contains: bool,
+    ) {
+        let Some(pending_document_id) = self.pending_contains_requests.remove(&request_id) else {
+            tracing::warn!(?request_id, "unknown local repo contains completion");
+            return;
+        };
+        debug_assert_eq!(pending_document_id, document_id);
+        let Some(pending) = self.pending_contains.remove(&document_id) else {
+            tracing::warn!(%document_id, ?request_id, "missing pending contains for completion");
+            return;
+        };
+        debug_assert_eq!(pending.request_id, request_id);
+        for command_id in pending.command_ids {
+            self.pending_commands.complete_contains_document_local(
+                command_id,
+                document_id.clone(),
+                contains,
+            );
+        }
+    }
+
+    fn handle_export_document_complete(
+        &mut self,
+        request_id: LocalRepoRequestId,
+        document_id: DocumentId,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let Some(pending_document_id) = self.pending_export_requests.remove(&request_id) else {
+            tracing::warn!(?request_id, "unknown local repo export completion");
+            return;
+        };
+        debug_assert_eq!(pending_document_id, document_id);
+        let Some(pending) = self.pending_exports.remove(&document_id) else {
+            tracing::warn!(%document_id, ?request_id, "missing pending export for completion");
+            return;
+        };
+        debug_assert_eq!(pending.request_id, request_id);
+        for command_id in pending.command_ids {
+            self.pending_commands.complete_export_document_local(
+                command_id,
+                document_id.clone(),
+                bytes.clone(),
+            );
+        }
     }
 
     #[tracing::instrument(skip(self, out), fields(document_id = %document_id))]
