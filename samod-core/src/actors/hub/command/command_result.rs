@@ -28,6 +28,17 @@ pub enum CommandResult {
     ImportDocumentAlreadyExists {
         document_id: DocumentId,
     },
+    ExportDocumentLocal {
+        document_id: DocumentId,
+        bytes: Vec<u8>,
+    },
+    ExportDocumentLocalNotFound {
+        document_id: DocumentId,
+    },
+    ContainsDocumentLocal {
+        document_id: DocumentId,
+        contains: bool,
+    },
     /// Result of FindDocument command.
     FindDocument {
         actor_id: DocumentActorId,

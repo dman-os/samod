@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use automerge::{Automerge, ReadDoc};
-use samod::{ImportError, PeerId, Repo, RepoEvent, RepoObserver, storage::InMemoryStorage};
+use samod::{
+    ImportError, LocalExportError, PeerId, Repo, RepoEvent, RepoObserver, storage::InMemoryStorage,
+};
 mod tincans;
 
 fn init_logging() {
@@ -1029,4 +1031,83 @@ async fn imported_documents_with_separate_histories_sync_over_tincans() {
 
     alice.stop().await;
     bob.stop().await;
+}
+
+#[tokio::test]
+async fn local_export_prefers_active_actor_state() {
+    init_logging();
+
+    let repo = Repo::build_tokio().load().await;
+    let handle = repo.create(make_doc_with_field("before")).await.unwrap();
+    let doc_id = handle.document_id().clone();
+
+    handle.with_document(|doc| {
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "value", "after")?;
+            Ok(())
+        })
+        .unwrap();
+    });
+
+    let exported = repo.local_export(doc_id).await.unwrap();
+    let value = exported.get(automerge::ROOT, "value").unwrap().unwrap().0;
+    assert_eq!(value.to_str(), Some("after"));
+
+    repo.stop().await;
+}
+
+#[tokio::test]
+async fn local_export_reads_from_storage_after_eviction() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let storage = InMemoryStorage::new();
+    let repo = Repo::build_tokio()
+        .with_storage(storage.clone())
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let handle = repo.create(make_doc_with_field("persisted")).await.unwrap();
+    let doc_id = handle.document_id().clone();
+    drop(handle);
+    wait_for_closed_count(&observer, 1).await;
+
+    let exported = repo.local_export(doc_id).await.unwrap();
+    let value = exported.get(automerge::ROOT, "value").unwrap().unwrap().0;
+    assert_eq!(value.to_str(), Some("persisted"));
+
+    repo.stop().await;
+}
+
+#[tokio::test]
+async fn local_export_not_found_for_unknown_document() {
+    init_logging();
+
+    let repo = Repo::build_tokio().load().await;
+    let doc_id = samod::DocumentId::new(&mut rand::rng());
+
+    let result = repo.local_export(doc_id.clone()).await;
+    match result {
+        Err(LocalExportError::NotFound { document_id }) => assert_eq!(document_id, doc_id),
+        other => panic!("unexpected local_export result: {other:?}"),
+    }
+
+    repo.stop().await;
+}
+
+#[tokio::test]
+async fn local_contains_document_reports_presence() {
+    init_logging();
+
+    let repo = Repo::build_tokio().load().await;
+    let handle = repo.create(make_doc_with_field("exists")).await.unwrap();
+    let existing_doc_id = handle.document_id().clone();
+    let missing_doc_id = samod::DocumentId::new(&mut rand::rng());
+
+    assert!(repo.local_contains_document(existing_doc_id).await.unwrap());
+    assert!(!repo.local_contains_document(missing_doc_id).await.unwrap());
+
+    repo.stop().await;
 }

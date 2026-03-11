@@ -10,4 +10,12 @@ pub(crate) enum HubToLocalRepoMsgPayload {
         document_id: DocumentId,
         request_id: LocalRepoRequestId,
     },
+    ContainsDocument {
+        document_id: DocumentId,
+        request_id: LocalRepoRequestId,
+    },
+    ExportDocument {
+        document_id: DocumentId,
+        request_id: LocalRepoRequestId,
+    },
 }

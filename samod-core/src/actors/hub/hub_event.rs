@@ -115,6 +115,16 @@ impl HubEvent {
         })
     }
 
+    /// Creates a command to check local existence of a document without peer queries.
+    pub fn contains_document_local(document_id: DocumentId) -> DispatchedCommand {
+        Self::dispatch_command(Command::ContainsDocumentLocal { document_id })
+    }
+
+    /// Creates a command to export a local document without peer queries.
+    pub fn export_document_local(document_id: DocumentId) -> DispatchedCommand {
+        Self::dispatch_command(Command::ExportDocumentLocal { document_id })
+    }
+
     /// Creates a command to find and load an existing document.
     pub fn find_document(document_id: DocumentId) -> DispatchedCommand {
         Self::dispatch_command(Command::FindDocument { document_id })
@@ -254,6 +264,8 @@ impl HubEvent {
                     Command::ActorReady { .. } => "actor_ready",
                     Command::CreateDocument { .. } => "create_document",
                     Command::ImportDocument { .. } => "import_document",
+                    Command::ContainsDocumentLocal { .. } => "contains_document_local",
+                    Command::ExportDocumentLocal { .. } => "export_document_local",
                     Command::FindDocument { .. } => "find_document",
                 },
                 HubInput::Tick => "tick",
