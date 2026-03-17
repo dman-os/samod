@@ -17,6 +17,10 @@
 * Exposed receiving `ConnectionHandle`s via `accept()`. Users can now subscribe
   to an `events()` stream directly on the handle, or `await` for
   `handshake_completed()`.
+* Split websocket TLS backend selection into explicit feature flags:
+  `tungstenite-native-tls`, `tungstenite-rustls-native-roots`, and
+  `tungstenite-rustls-webpki-roots`. The base `tungstenite` feature no longer
+  forces `native-tls`.
 
 ## 0.8.0 - 2024-03-06
 
