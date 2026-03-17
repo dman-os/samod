@@ -62,6 +62,10 @@ impl DocActorInner {
         &self.document_id
     }
 
+    pub(crate) fn is_document_ready(&self) -> bool {
+        self.actor.is_document_ready()
+    }
+
     pub(crate) fn with_document<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut Automerge) -> R,

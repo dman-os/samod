@@ -346,6 +346,8 @@ mod stopped;
 pub use stopped::Stopped;
 mod import_error;
 pub use import_error::ImportError;
+mod local_export_error;
+pub use local_export_error::LocalExportError;
 mod local_repo_actor_inner;
 mod local_repo_actor_task;
 mod local_repo_runner;
@@ -603,6 +605,81 @@ impl Repo {
                 }
             },
             Err(_) => Err(ImportError::Stopped),
+        }
+    }
+
+    /// Export a local document as an [`automerge::Automerge`] value.
+    ///
+    /// This method only inspects local state and does not query peers.
+    pub async fn local_export(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Automerge, LocalExportError> {
+        // Fast-path for active actors to get freshest in-memory state.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(actor_id) = inner.actor_id_for_local_document(&document_id)
+                && let Some(actor_handle) = inner.actors.get(&actor_id)
+            {
+                let actor = actor_handle.inner.lock().unwrap();
+                if actor.is_document_ready() {
+                    return Ok(actor.document().clone());
+                }
+            }
+        }
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let DispatchedCommand { command_id, event } =
+                HubEvent::export_document_local(document_id.clone());
+            let mut inner = self.inner.lock().unwrap();
+            inner.handle_event(event);
+            inner.pending_commands.insert(command_id, tx);
+        }
+
+        match rx.await {
+            Ok(CommandResult::ExportDocumentLocal {
+                document_id: _,
+                bytes,
+            }) => {
+                let mut doc = Automerge::new();
+                doc.load_incremental(&bytes)
+                    .expect("invalid local export bytes");
+                Ok(doc)
+            }
+            Ok(CommandResult::ExportDocumentLocalNotFound { document_id }) => {
+                Err(LocalExportError::NotFound { document_id })
+            }
+            Ok(other) => panic!("unexpected command result for local export: {other:?}"),
+            Err(_) => Err(LocalExportError::Stopped),
+        }
+    }
+
+    /// Check whether a document exists locally without peer queries.
+    pub async fn local_contains_document(&self, document_id: DocumentId) -> Result<bool, Stopped> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.actor_id_for_local_document(&document_id).is_some() {
+                return Ok(true);
+            }
+        }
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let DispatchedCommand { command_id, event } =
+                HubEvent::contains_document_local(document_id.clone());
+            let mut inner = self.inner.lock().unwrap();
+            inner.handle_event(event);
+            inner.pending_commands.insert(command_id, tx);
+        }
+
+        match rx.await {
+            Ok(CommandResult::ContainsDocumentLocal {
+                document_id: _,
+                contains,
+            }) => Ok(contains),
+            Ok(other) => panic!("unexpected command result for local contains: {other:?}"),
+            Err(_) => Err(Stopped),
         }
     }
 
@@ -904,6 +981,7 @@ impl Repo {
 struct Inner {
     doc_runner: DocRunner,
     actors: HashMap<DocumentActorId, ActorHandle>,
+    document_to_actor: HashMap<DocumentId, DocumentActorId>,
     local_repo_actors: HashMap<LocalRepoActorId, Arc<Mutex<LocalRepoActorInner>>>,
     local_repo_task_senders:
         HashMap<LocalRepoActorId, unbounded::UnboundedSender<LocalRepoActorTask>>,
@@ -972,6 +1050,7 @@ impl Inner {
         actor_id: DocumentActorId,
         document_id: DocumentId,
     ) -> DocHandle {
+        self.document_to_actor.insert(document_id.clone(), actor_id);
         let (inner, existing_lease, next_generation) = {
             let actor_handle = self
                 .actors
@@ -1007,6 +1086,20 @@ impl Inner {
             lease
         };
         DocHandle::new(document_id, inner, lease)
+    }
+
+    fn actor_id_for_local_document(&mut self, document_id: &DocumentId) -> Option<DocumentActorId> {
+        let actor_id = self.document_to_actor.get(document_id).copied()?;
+        let is_valid = self.actors.get(&actor_id).is_some_and(|actor_handle| {
+            let actor = actor_handle.inner.lock().unwrap();
+            !actor.is_stopped() && actor.document_id() == document_id
+        });
+        if is_valid {
+            Some(actor_id)
+        } else {
+            self.document_to_actor.remove(document_id);
+            None
+        }
     }
 
     #[tracing::instrument(skip(self, event), fields(local_peer_id=%self.hub.peer_id()))]
@@ -1271,6 +1364,7 @@ impl Inner {
                 lease_generation: 0,
             },
         );
+        self.document_to_actor.insert(doc_id.clone(), actor_id);
 
         match &mut self.doc_runner {
             #[cfg(feature = "threadpool")]
@@ -1446,6 +1540,7 @@ impl TaskSetup {
         let inner = Arc::new(Mutex::new(Inner {
             doc_runner,
             actors: HashMap::new(),
+            document_to_actor: HashMap::new(),
             hub: *hub,
             pending_commands: HashMap::new(),
             connections: HashMap::new(),

@@ -34,6 +34,12 @@ pub(crate) enum Command {
         content: Box<Automerge>,
     },
 
+    /// Returns whether a document exists in local storage or active actors.
+    ContainsDocumentLocal { document_id: DocumentId },
+
+    /// Exports a local document as serialized bytes.
+    ExportDocumentLocal { document_id: DocumentId },
+
     /// Finds and loads an existing document.
     FindDocument { document_id: DocumentId },
 }
@@ -61,6 +67,14 @@ impl std::fmt::Debug for Command {
                 .debug_struct("ImportDocument")
                 .field("document_id", document_id)
                 .field("content", &"<Automerge>")
+                .finish(),
+            Command::ContainsDocumentLocal { document_id } => f
+                .debug_struct("ContainsDocumentLocal")
+                .field("document_id", document_id)
+                .finish(),
+            Command::ExportDocumentLocal { document_id } => f
+                .debug_struct("ExportDocumentLocal")
+                .field("document_id", document_id)
                 .finish(),
             Command::FindDocument { document_id } => f
                 .debug_struct("FindDocument")

@@ -36,6 +36,10 @@
         toolInputs = with pkgs; [
           prek
           rustStable
+
+          pkg-config
+          glib
+          openssl
         ];
 
         ldPaths = with pkgs; lib.makeLibraryPath (

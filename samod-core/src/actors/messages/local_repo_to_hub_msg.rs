@@ -10,5 +10,15 @@ pub(crate) enum LocalRepoToHubMsgPayload {
         document_id: DocumentId,
         occupied: bool,
     },
+    ContainsDocumentComplete {
+        request_id: LocalRepoRequestId,
+        document_id: DocumentId,
+        contains: bool,
+    },
+    ExportDocumentComplete {
+        request_id: LocalRepoRequestId,
+        document_id: DocumentId,
+        bytes: Option<Vec<u8>>,
+    },
     Terminated,
 }
