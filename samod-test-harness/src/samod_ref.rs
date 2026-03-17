@@ -39,6 +39,22 @@ impl SamodRef<'_> {
         self.wrapper().create_document(Some(content))
     }
 
+    pub fn import_document(
+        &mut self,
+        document_id: DocumentId,
+        content: Option<automerge::Automerge>,
+    ) -> RunningDocIds {
+        self.wrapper().import_document(document_id, content)
+    }
+
+    pub fn try_import_document(
+        &mut self,
+        document_id: DocumentId,
+        content: Option<automerge::Automerge>,
+    ) -> Result<RunningDocIds, DocumentId> {
+        self.wrapper().try_import_document(document_id, content)
+    }
+
     pub fn start_create_document(&mut self) -> CommandId {
         self.wrapper().start_create_document()
     }

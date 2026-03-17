@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use crate::{
     DocumentActorId,
     actors::{
-        HubToDocMsg,
-        document::SpawnArgs,
+        HubToDocMsg, HubToLocalRepoMsg,
+        document::SpawnArgs as DocumentSpawnArgs,
         hub::{CommandId, CommandResult, connection::Connection},
+        local_repo::{LocalRepoActorId, SpawnArgs as LocalRepoSpawnArgs},
         messages::HubToDocMsgPayload,
     },
     io::{IoTask, IoTaskId},
@@ -29,10 +30,16 @@ pub struct HubResults {
     pub completed_commands: HashMap<CommandId, CommandResult>,
 
     /// Requests to spawn new document actors.
-    pub spawn_actors: Vec<SpawnArgs>,
+    pub spawn_actors: Vec<DocumentSpawnArgs>,
+
+    /// Requests to spawn new local repo actors.
+    pub spawn_local_repo_actors: Vec<LocalRepoSpawnArgs>,
 
     /// Messages to send to document actors.
     pub actor_messages: Vec<(DocumentActorId, HubToDocMsg)>,
+
+    /// Messages to send to local repo actors.
+    pub local_repo_actor_messages: Vec<(LocalRepoActorId, HubToLocalRepoMsg)>,
 
     /// Connection events emitted during processing.
     pub connection_events: Vec<ConnectionEvent>,
@@ -92,16 +99,17 @@ impl HubResults {
         self.actor_messages.push((actor_id, HubToDocMsg(msg)));
     }
 
-    pub(crate) fn emit_spawn_actor(&mut self, args: SpawnArgs) {
+    pub(crate) fn emit_spawn_actor(&mut self, args: DocumentSpawnArgs) {
         self.spawn_actors.push(args)
+    }
+
+    pub(crate) fn emit_spawn_local_repo_actor(&mut self, args: LocalRepoSpawnArgs) {
+        self.spawn_local_repo_actors.push(args)
     }
 
     pub(crate) fn emit_io_action(&mut self, action: HubIoAction) -> IoTaskId {
         let task_id = IoTaskId::new();
-        self.new_tasks.push(IoTask {
-            task_id: IoTaskId::new(),
-            action,
-        });
+        self.new_tasks.push(IoTask { task_id, action });
         task_id
     }
 
@@ -111,5 +119,14 @@ impl HubResults {
 
     pub(crate) fn emit_connector_event(&mut self, event: DialerEvent) {
         self.dialer_events.push(event);
+    }
+
+    pub(crate) fn send_to_local_repo_actor(
+        &mut self,
+        actor_id: LocalRepoActorId,
+        msg: crate::actors::messages::HubToLocalRepoMsgPayload,
+    ) {
+        self.local_repo_actor_messages
+            .push((actor_id, HubToLocalRepoMsg(msg)));
     }
 }

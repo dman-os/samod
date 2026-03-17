@@ -302,9 +302,10 @@ pub use samod_core::{
 use samod_core::{
     CommandId, CommandResult, DocumentActorId, LoaderState, UnixTimestamp,
     actors::{
-        DocToHubMsg,
+        DocToHubMsg, LocalRepoToHubMsg,
         document::{DocumentActor, SpawnArgs},
         hub::{DispatchedCommand, Hub, HubEvent, HubResults, io::HubIoAction},
+        local_repo::{LocalRepoActor, LocalRepoActorId, SpawnArgs as LocalRepoSpawnArgs},
     },
     io::{IoResult, IoTask},
     network::{ConnectionEvent, ConnectionOwner, DialerConfig, ListenerConfig},
@@ -343,6 +344,11 @@ pub use peer_connection_info::{ConnectionInfo, ConnectionState, PeerDocState};
 pub use peer_info::PeerInfo;
 mod stopped;
 pub use stopped::Stopped;
+mod import_error;
+pub use import_error::ImportError;
+mod local_repo_actor_inner;
+mod local_repo_actor_task;
+mod local_repo_runner;
 pub mod storage;
 pub mod transport;
 pub use crate::announce_policy::{
@@ -355,6 +361,9 @@ use crate::{
     doc_lease::{DocLease, LeaseNotification},
     doc_runner::{DocRunner, SpawnedActor},
     io_loop::{DriveConnectionTask, IoLoopTask},
+    local_repo_actor_inner::LocalRepoActorInner,
+    local_repo_actor_task::LocalRepoActorTask,
+    local_repo_runner::{SpawnedLocalRepoActor, async_local_repo_actor_runner},
     storage::Storage,
     unbounded::{UnboundedReceiver, UnboundedSender},
 };
@@ -456,9 +465,17 @@ impl Repo {
             peer_id,
             announce_policy,
             concurrency,
+            local_repo_actor_count,
             observer,
         } = builder;
-        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency, observer).await;
+        let task_setup = TaskSetup::new(
+            storage.clone(),
+            peer_id,
+            concurrency,
+            local_repo_actor_count,
+            observer,
+        )
+        .await;
         let inner = task_setup.inner.clone();
         task_setup.spawn_tasks(runtime, storage, announce_policy);
         Self { inner }
@@ -478,9 +495,17 @@ impl Repo {
             peer_id,
             announce_policy,
             concurrency,
+            local_repo_actor_count,
             observer,
         } = builder;
-        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency, observer).await;
+        let task_setup = TaskSetup::new(
+            storage.clone(),
+            peer_id,
+            concurrency,
+            local_repo_actor_count,
+            observer,
+        )
+        .await;
         let inner = task_setup.inner.clone();
         task_setup.spawn_tasks_local(runtime, storage, announce_policy);
         Self { inner }
@@ -520,6 +545,64 @@ impl Repo {
                 }
             },
             Err(_) => Err(Stopped),
+        }
+    }
+
+    /// Import a document with an explicit ID.
+    ///
+    /// This creates a local document using the caller-provided [`DocumentId`]
+    /// instead of generating a new one.
+    ///
+    /// Import only checks for conflicts in this local repo:
+    /// - an already-active actor for the same document ID
+    /// - persisted document data already present in local storage
+    ///
+    /// It does not check whether some other peer has already used the same
+    /// [`DocumentId`] for a different history. Callers are expected to use
+    /// globally unique document IDs when importing.
+    ///
+    /// If you need to avoid conflicts with docs that may already exist on
+    /// connected peers, use [`Repo::find`] first and only import when the
+    /// document is known to be absent locally. [`Repo::find`] performs local
+    /// lookup and may also discover the document from peers.
+    ///
+    /// If two peers import different Automerge histories under the same
+    /// [`DocumentId`], samod will treat them as the same logical document when
+    /// they later sync. Automerge will merge those histories as concurrent
+    /// changes, which can produce an unintended combined document rather than a
+    /// rejection.
+    pub async fn import(
+        &self,
+        document_id: DocumentId,
+        initial_content: Automerge,
+    ) -> Result<DocHandle, ImportError> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let DispatchedCommand { command_id, event } =
+                HubEvent::import_document(document_id.clone(), initial_content);
+            let mut inner = self.inner.lock().unwrap();
+            inner.handle_event(event);
+            inner.pending_commands.insert(command_id, tx);
+            drop(inner);
+        }
+        let inner = self.inner.clone();
+        match rx.await {
+            Ok(r) => match r {
+                CommandResult::ImportDocument {
+                    actor_id,
+                    document_id,
+                } => {
+                    let mut inner = inner.lock().unwrap();
+                    Ok(inner.acquire_doc_handle(actor_id, document_id))
+                }
+                CommandResult::ImportDocumentAlreadyExists { document_id } => {
+                    Err(ImportError::AlreadyExists { document_id })
+                }
+                other => {
+                    panic!("unexpected command result for import: {other:?}");
+                }
+            },
+            Err(_) => Err(ImportError::Stopped),
         }
     }
 
@@ -821,12 +904,16 @@ impl Repo {
 struct Inner {
     doc_runner: DocRunner,
     actors: HashMap<DocumentActorId, ActorHandle>,
+    local_repo_actors: HashMap<LocalRepoActorId, Arc<Mutex<LocalRepoActorInner>>>,
+    local_repo_task_senders:
+        HashMap<LocalRepoActorId, unbounded::UnboundedSender<LocalRepoActorTask>>,
     hub: Hub,
     pending_commands: HashMap<CommandId, oneshot::Sender<CommandResult>>,
     connections: HashMap<ConnectionId, ConnectionHandle>,
     conn_listeners: Vec<unbounded::UnboundedSender<Vec<ConnectionInfo>>>,
     tx_io: UnboundedSender<io_loop::IoLoopTask>,
     tx_to_core: UnboundedSender<(DocumentActorId, DocToHubMsg)>,
+    tx_local_repo_to_core: UnboundedSender<(LocalRepoActorId, LocalRepoToHubMsg)>,
     waiting_for_connection: HashMap<PeerId, Vec<oneshot::Sender<Connection>>>,
     stop_waiters: Vec<oneshot::Sender<()>>,
     rng: rand::rngs::StdRng,
@@ -835,6 +922,7 @@ struct Inner {
     acceptor_handles: HashMap<ListenerId, AcceptorHandle>,
     observer: Option<Arc<dyn observer::RepoObserver>>,
     tx_repo_events: UnboundedSender<LeaseNotification>,
+    tx_spawn_local_repo_actor: UnboundedSender<SpawnedLocalRepoActor>,
 }
 
 impl Inner {
@@ -869,6 +957,14 @@ impl Inner {
                 let _ = tx.unbounded_send(task);
             }
         }
+    }
+
+    fn dispatch_local_repo_task(&self, actor_id: LocalRepoActorId, task: LocalRepoActorTask) {
+        let Some(tx) = self.local_repo_task_senders.get(&actor_id) else {
+            tracing::warn!(?actor_id, "received task for unknown local repo actor");
+            return;
+        };
+        let _ = tx.unbounded_send(task);
     }
 
     fn acquire_doc_handle(
@@ -927,7 +1023,9 @@ impl Inner {
             new_tasks,
             completed_commands,
             spawn_actors,
+            spawn_local_repo_actors,
             actor_messages,
+            local_repo_actor_messages,
             stopped,
             connection_events,
             dial_requests,
@@ -939,6 +1037,10 @@ impl Inner {
 
         for spawn_args in spawn_actors {
             self.spawn_actor(spawn_args);
+        }
+
+        for spawn_args in spawn_local_repo_actors {
+            self.spawn_local_repo_actor(spawn_args);
         }
 
         for (command_id, command) in completed_commands {
@@ -982,6 +1084,10 @@ impl Inner {
 
         for (actor_id, actor_msg) in actor_messages {
             self.dispatch_task(actor_id, ActorTask::HandleMessage(actor_msg));
+        }
+
+        for (actor_id, actor_msg) in local_repo_actor_messages {
+            self.dispatch_local_repo_task(actor_id, LocalRepoActorTask::HandleMessage(actor_msg));
         }
 
         if !connection_events.is_empty() && !self.conn_listeners.is_empty() {
@@ -1198,6 +1304,33 @@ impl Inner {
             }
         }
     }
+
+    fn spawn_local_repo_actor(&mut self, args: LocalRepoSpawnArgs) {
+        let actor_id = args.actor_id();
+        let (actor, init_results) = LocalRepoActor::new(args);
+        let inner = Arc::new(Mutex::new(LocalRepoActorInner::new(
+            actor_id,
+            actor,
+            self.tx_local_repo_to_core.clone(),
+            self.tx_io.clone(),
+            self.observer.clone(),
+        )));
+        let (tx, rx) = unbounded::channel();
+        self.local_repo_task_senders.insert(actor_id, tx);
+        self.local_repo_actors.insert(actor_id, inner.clone());
+        if self
+            .tx_spawn_local_repo_actor
+            .unbounded_send(SpawnedLocalRepoActor {
+                actor_id,
+                inner,
+                rx_tasks: rx,
+                init_results,
+            })
+            .is_err()
+        {
+            tracing::error!(?actor_id, "local repo actor spawner is gone");
+        }
+    }
 }
 
 /// Spawns a task which listens for new actors to spawn and runs them
@@ -1266,8 +1399,10 @@ struct TaskSetup {
     tx_io: UnboundedSender<IoLoopTask>,
     rx_storage: UnboundedReceiver<IoLoopTask>,
     rx_from_core: UnboundedReceiver<(DocumentActorId, DocToHubMsg)>,
+    rx_from_local_repo_core: UnboundedReceiver<(LocalRepoActorId, LocalRepoToHubMsg)>,
     rx_repo_events: UnboundedReceiver<LeaseNotification>,
     rx_actor: Option<UnboundedReceiver<SpawnedActor>>,
+    rx_local_repo_actor: UnboundedReceiver<SpawnedLocalRepoActor>,
     dialers: Arc<Mutex<HashMap<DialerId, io_loop::DynDialer>>>,
     observer: Option<Arc<dyn observer::RepoObserver>>,
 }
@@ -1277,6 +1412,7 @@ impl TaskSetup {
         storage: S,
         peer_id: Option<PeerId>,
         concurrency: ConcurrencyConfig,
+        local_repo_actor_count: usize,
         observer: Option<Arc<dyn observer::RepoObserver>>,
     ) -> TaskSetup {
         let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
@@ -1286,7 +1422,9 @@ impl TaskSetup {
         let (tx_storage, rx_storage) = unbounded::channel();
         let tx_io_for_tick = tx_storage.clone();
         let (tx_to_core, rx_from_core) = unbounded::channel();
+        let (tx_local_repo_to_core, rx_from_local_repo_core) = unbounded::channel();
         let (tx_repo_events, rx_repo_events) = unbounded::channel();
+        let (tx_spawn_local_repo_actor, rx_local_repo_actor) = unbounded::channel();
         let rx_actor: Option<UnboundedReceiver<SpawnedActor>>;
         let doc_runner = match concurrency {
             #[cfg(feature = "threadpool")]
@@ -1314,6 +1452,7 @@ impl TaskSetup {
             conn_listeners: Vec::new(),
             tx_io: tx_storage,
             tx_to_core,
+            tx_local_repo_to_core,
             waiting_for_connection: HashMap::new(),
             stop_waiters: Vec::new(),
             rng: rand::rngs::StdRng::from_os_rng(),
@@ -1322,14 +1461,26 @@ impl TaskSetup {
             acceptor_handles: HashMap::new(),
             observer: observer.clone(),
             tx_repo_events,
+            local_repo_actors: HashMap::new(),
+            local_repo_task_senders: HashMap::new(),
+            tx_spawn_local_repo_actor,
         }));
+
+        inner
+            .lock()
+            .unwrap()
+            .handle_event(HubEvent::configure_local_repo_actors(
+                local_repo_actor_count,
+            ));
 
         TaskSetup {
             peer_id,
             inner,
             tx_io: tx_io_for_tick,
             rx_actor,
+            rx_local_repo_actor,
             rx_from_core,
+            rx_from_local_repo_core,
             rx_repo_events,
             rx_storage,
             dialers,
@@ -1375,6 +1526,19 @@ impl TaskSetup {
             let peer_id = self.peer_id.clone();
             let inner = self.inner.clone();
             async move {
+                let rx = self.rx_from_local_repo_core;
+                while let Ok((actor_id, msg)) = rx.recv().await {
+                    let event = HubEvent::local_repo_actor_message(actor_id, msg);
+                    inner.lock().unwrap().handle_event(event);
+                }
+            }
+            .instrument(tracing::info_span!("local_repo_actor_loop", local_peer_id=%peer_id))
+            .boxed_local()
+        });
+        runtime.spawn({
+            let peer_id = self.peer_id.clone();
+            let inner = self.inner.clone();
+            async move {
                 let rx = self.rx_repo_events;
                 while let Ok(msg) = rx.recv().await {
                     match msg {
@@ -1400,6 +1564,7 @@ impl TaskSetup {
         if let Some(rx_actor) = self.rx_actor {
             runtime.spawn(async_actor_runner(rx_actor).boxed_local());
         }
+        runtime.spawn(async_local_repo_actor_runner(self.rx_local_repo_actor).boxed_local());
     }
 
     fn spawn_tasks<R: RuntimeHandle + Clone + Send, S: Storage, A: AnnouncePolicy>(
@@ -1437,6 +1602,19 @@ impl TaskSetup {
             let peer_id = self.peer_id.clone();
             let inner = self.inner.clone();
             async move {
+                let rx = self.rx_from_local_repo_core;
+                while let Ok((actor_id, msg)) = rx.recv().await {
+                    let event = HubEvent::local_repo_actor_message(actor_id, msg);
+                    inner.lock().unwrap().handle_event(event);
+                }
+            }
+            .instrument(tracing::info_span!("local_repo_actor_loop", local_peer_id=%peer_id))
+            .boxed()
+        });
+        runtime.spawn({
+            let peer_id = self.peer_id.clone();
+            let inner = self.inner.clone();
+            async move {
                 let rx = self.rx_repo_events;
                 while let Ok(msg) = rx.recv().await {
                     match msg {
@@ -1462,6 +1640,7 @@ impl TaskSetup {
         if let Some(rx_actor) = self.rx_actor {
             runtime.spawn(async_actor_runner(rx_actor).boxed());
         }
+        runtime.spawn(async_local_repo_actor_runner(self.rx_local_repo_actor).boxed());
     }
 }
 

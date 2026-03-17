@@ -3,8 +3,9 @@ use automerge::{Automerge, transaction::CommitOptions};
 use crate::{
     ConnectionId, DialerId, DocumentActorId, DocumentId, ListenerId,
     actors::{
-        DocToHubMsg,
+        DocToHubMsg, LocalRepoToHubMsg,
         hub::{Command, CommandId},
+        local_repo::LocalRepoActorId,
     },
     io::IoResult,
     network::{DialerConfig, ListenerConfig},
@@ -50,6 +51,18 @@ impl HubEvent {
         }
     }
 
+    pub fn local_repo_actor_message(
+        actor_id: LocalRepoActorId,
+        message: LocalRepoToHubMsg,
+    ) -> Self {
+        HubEvent {
+            payload: HubEventPayload::Input(HubInput::LocalRepoActorMessage {
+                actor_id,
+                message: message.0,
+            }),
+        }
+    }
+
     pub fn local_handles_acquired(document_id: DocumentId, generation: u64) -> Self {
         HubEvent {
             payload: HubEventPayload::Input(HubInput::LocalHandlesAcquired {
@@ -88,9 +101,29 @@ impl HubEvent {
         })
     }
 
+    /// Creates a command to import a document with an explicit document ID.
+    pub fn import_document(
+        document_id: DocumentId,
+        mut initial_content: Automerge,
+    ) -> DispatchedCommand {
+        if initial_content.is_empty() {
+            initial_content.empty_commit(CommitOptions::default());
+        }
+        Self::dispatch_command(Command::ImportDocument {
+            document_id,
+            content: Box::new(initial_content),
+        })
+    }
+
     /// Creates a command to find and load an existing document.
     pub fn find_document(document_id: DocumentId) -> DispatchedCommand {
         Self::dispatch_command(Command::FindDocument { document_id })
+    }
+
+    pub fn configure_local_repo_actors(count: usize) -> Self {
+        HubEvent {
+            payload: HubEventPayload::Input(HubInput::ConfigureLocalRepoActors { count }),
+        }
     }
 
     /// Creates an event indicating that a network connection has been lost externally.
@@ -220,10 +253,12 @@ impl HubEvent {
                     Command::Receive { .. } => "receive",
                     Command::ActorReady { .. } => "actor_ready",
                     Command::CreateDocument { .. } => "create_document",
+                    Command::ImportDocument { .. } => "import_document",
                     Command::FindDocument { .. } => "find_document",
                 },
                 HubInput::Tick => "tick",
                 HubInput::ActorMessage { .. } => "actor_message",
+                HubInput::LocalRepoActorMessage { .. } => "local_repo_actor_message",
                 HubInput::LocalHandlesAcquired { .. } => "local_handles_acquired",
                 HubInput::LocalHandlesDropped { .. } => "local_handles_dropped",
                 HubInput::ConnectionLost { .. } => "connection_lost",
@@ -234,6 +269,7 @@ impl HubEvent {
                 HubInput::DialFailed { .. } => "dial_failed",
                 HubInput::RemoveDialer { .. } => "remove_dialer",
                 HubInput::RemoveListener { .. } => "remove_listener",
+                HubInput::ConfigureLocalRepoActors { .. } => "configure_local_repo_actors",
             },
         }
     }

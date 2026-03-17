@@ -6,6 +6,7 @@ use samod_core::{
 };
 
 mod doc_actor_runner;
+mod local_repo_actor_runner;
 mod running_doc_ids;
 pub use running_doc_ids::RunningDocIds;
 mod samod_id;

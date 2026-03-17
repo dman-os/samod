@@ -14,12 +14,15 @@ use samod_core::{
             DispatchedCommand, HubEvent,
             io::{HubIoAction, HubIoResult},
         },
+        local_repo::LocalRepoActorId,
     },
     io::{IoResult, IoTask},
     network::{ConnectionEvent, ConnectionInfo, DialerConfig, ListenerConfig, PeerDocState},
 };
 
-use crate::{Storage, doc_actor_runner::DocActorRunner};
+use crate::{
+    Storage, doc_actor_runner::DocActorRunner, local_repo_actor_runner::LocalRepoActorRunner,
+};
 
 use super::running_doc_ids::RunningDocIds;
 
@@ -36,6 +39,7 @@ pub struct SamodWrapper {
     pub(super) outbox: HashMap<ConnectionId, VecDeque<Vec<u8>>>,
     // Document actors managed by this wrapper
     document_actors: HashMap<DocumentActorId, DocActorRunner>,
+    local_repo_actors: HashMap<LocalRepoActorId, LocalRepoActorRunner>,
     // Connection events captured during event processing
     connection_events: Vec<ConnectionEvent>,
     announce_policy: Box<dyn Fn(DocumentId, PeerId) -> bool>,
@@ -74,7 +78,7 @@ impl SamodWrapper {
             }
         };
 
-        SamodWrapper {
+        let mut wrapper = SamodWrapper {
             hub: *hub,
             storage,
             inbox: VecDeque::new(),
@@ -82,10 +86,16 @@ impl SamodWrapper {
             now,
             outbox: HashMap::new(),
             document_actors: HashMap::new(),
+            local_repo_actors: HashMap::new(),
             connection_events: Vec::new(),
             announce_policy: Box::new(|_, _| true),
             test_listener_id: None,
-        }
+        };
+        wrapper
+            .inbox
+            .push_back(HubEvent::configure_local_repo_actors(1));
+        wrapper.handle_events();
+        wrapper
     }
 
     pub fn pause_storage(&mut self) {
@@ -219,6 +229,42 @@ impl SamodWrapper {
         }
     }
 
+    pub fn import_document(
+        &mut self,
+        document_id: DocumentId,
+        initial_content: Option<automerge::Automerge>,
+    ) -> RunningDocIds {
+        self.try_import_document(document_id, initial_content)
+            .expect("The import document command should succeed")
+    }
+
+    pub fn try_import_document(
+        &mut self,
+        document_id: DocumentId,
+        initial_content: Option<automerge::Automerge>,
+    ) -> Result<RunningDocIds, DocumentId> {
+        let initial_content = initial_content.unwrap_or_default();
+        let DispatchedCommand { command_id, event } =
+            HubEvent::import_document(document_id.clone(), initial_content);
+        self.inbox.push_back(event);
+        self.handle_events();
+        let completed_command = self
+            .completed_commands
+            .remove(&command_id)
+            .expect("The create document command never completed");
+        match completed_command {
+            CommandResult::ImportDocument {
+                document_id,
+                actor_id,
+            } => Ok(RunningDocIds {
+                doc_id: document_id,
+                actor_id,
+            }),
+            CommandResult::ImportDocumentAlreadyExists { document_id } => Err(document_id),
+            _ => panic!("Expected an ImportDocument command result, but got {completed_command:?}"),
+        }
+    }
+
     pub fn start_create_document(&mut self) -> CommandId {
         let DispatchedCommand { command_id, event } = HubEvent::create_document(Automerge::new());
         self.inbox.push_back(event);
@@ -280,6 +326,15 @@ impl SamodWrapper {
                     .map(|msg| HubEvent::actor_message(*actor_id, msg)),
             );
         }
+        for (actor_id, runner) in &mut self.local_repo_actors {
+            runner.handle_events(&mut self.storage);
+            self.inbox.extend(
+                runner
+                    .take_outbox()
+                    .into_iter()
+                    .map(|msg| HubEvent::local_repo_actor_message(*actor_id, msg)),
+            );
+        }
         while let Some(event) = self.inbox.pop_front() {
             self.now += Duration::from_millis(10);
             let mut rng = rand::rng();
@@ -318,11 +373,23 @@ impl SamodWrapper {
                 self.document_actors.insert(actor_id, actor);
             }
 
+            for args in results.spawn_local_repo_actors {
+                let actor_id = args.actor_id();
+                let actor = LocalRepoActorRunner::new(args);
+                self.local_repo_actors.insert(actor_id, actor);
+            }
+
             // Handle messages to document actors
             for (actor_id, message) in results.actor_messages {
                 self.document_actors
                     .get_mut(&actor_id)
                     .expect("message for missing actor")
+                    .deliver_message_to_inbox(message);
+            }
+            for (actor_id, message) in results.local_repo_actor_messages {
+                self.local_repo_actors
+                    .get_mut(&actor_id)
+                    .expect("message for missing local repo actor")
                     .deliver_message_to_inbox(message);
             }
 
@@ -342,6 +409,24 @@ impl SamodWrapper {
             }
             for actor_id in stopped {
                 self.document_actors.remove(&actor_id);
+            }
+
+            let mut stopped = Vec::new();
+            for (actor_id, runner) in &mut self.local_repo_actors {
+                runner.handle_events(&mut self.storage);
+                self.inbox.extend(
+                    runner
+                        .take_outbox()
+                        .into_iter()
+                        .map(|msg| HubEvent::local_repo_actor_message(*actor_id, msg)),
+                );
+                if runner.is_stopped() {
+                    tracing::info!(?actor_id, "removing stopped local repo actor");
+                    stopped.push(*actor_id);
+                }
+            }
+            for actor_id in stopped {
+                self.local_repo_actors.remove(&actor_id);
             }
         }
     }
