@@ -1,15 +1,57 @@
 #![cfg(feature = "tokio")]
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use automerge::Automerge;
-use samod::{PeerId, Repo, storage::InMemoryStorage};
+use samod::{PeerId, Repo, RepoEvent, RepoObserver, storage::InMemoryStorage};
 mod tincans;
 
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+}
+
+#[derive(Clone, Default)]
+struct CountingObserver {
+    opened: Arc<Mutex<Vec<samod::DocumentId>>>,
+    closed: Arc<Mutex<Vec<samod::DocumentId>>>,
+}
+
+impl CountingObserver {
+    fn closed_count(&self) -> usize {
+        self.closed.lock().unwrap().len()
+    }
+}
+
+impl RepoObserver for CountingObserver {
+    fn observe(&self, event: &RepoEvent) {
+        match event {
+            RepoEvent::DocumentOpened { document_id } => {
+                self.opened.lock().unwrap().push(document_id.clone());
+            }
+            RepoEvent::DocumentClosed { document_id } => {
+                self.closed.lock().unwrap().push(document_id.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_closed_count(observer: &CountingObserver, expected: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if observer.closed_count() >= expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for closed count to reach {expected}, current={}",
+            observer.closed_count()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -659,6 +701,181 @@ async fn when_connected_multiple_waiters_same_peer() {
     assert_eq!(conn2.info().unwrap().peer_id, bob_peer_id);
     // Both should be the same connection
     assert_eq!(conn1.id(), conn2.id());
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test]
+async fn last_clone_drop_closes_offline_document() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let storage = InMemoryStorage::new();
+    let repo = Repo::build_tokio()
+        .with_storage(storage.clone())
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let doc = repo.create(Automerge::new()).await.unwrap();
+    let doc_id = doc.document_id().clone();
+    let doc_clone = doc.clone();
+
+    drop(doc);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(observer.closed_count(), 0);
+
+    drop(doc_clone);
+    wait_for_closed_count(&observer, 1).await;
+
+    let reloaded = Repo::build_tokio()
+        .with_storage(storage)
+        .with_observer(CountingObserver::default())
+        .load()
+        .await;
+    assert!(reloaded.find(doc_id).await.unwrap().is_some());
+
+    reloaded.stop().await;
+    repo.stop().await;
+}
+
+#[tokio::test]
+async fn changes_stream_keeps_document_alive_after_handle_drop() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let repo = Repo::build_tokio()
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let doc = repo.create(Automerge::new()).await.unwrap();
+    let changes = doc.changes();
+    drop(doc);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(observer.closed_count(), 0);
+
+    drop(changes);
+    wait_for_closed_count(&observer, 1).await;
+
+    repo.stop().await;
+}
+
+#[tokio::test]
+async fn connected_documents_are_not_evicted_when_handle_drops() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let alice = Repo::build_tokio()
+        .with_peer_id(PeerId::from("alice"))
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let bob = Repo::build_tokio()
+        .with_peer_id(PeerId::from("bob"))
+        .load()
+        .await;
+
+    let _connected = tincans::connect_repos(&alice, &bob).await;
+
+    let doc = alice.create(Automerge::new()).await.unwrap();
+    drop(doc);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(observer.closed_count(), 0);
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test]
+async fn non_announced_connected_documents_are_evicted_when_handle_drops() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let alice = Repo::build_tokio()
+        .with_peer_id(PeerId::from("alice"))
+        .with_announce_policy(|_, _| false)
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let bob = Repo::build_tokio()
+        .with_peer_id(PeerId::from("bob"))
+        .load()
+        .await;
+
+    let _connected = tincans::connect_repos(&alice, &bob).await;
+
+    let doc = alice.create(Automerge::new()).await.unwrap();
+    drop(doc);
+
+    wait_for_closed_count(&observer, 1).await;
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test]
+async fn announced_connected_documents_evict_after_disconnect() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let alice = Repo::build_tokio()
+        .with_peer_id(PeerId::from("alice"))
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let bob = Repo::build_tokio()
+        .with_peer_id(PeerId::from("bob"))
+        .load()
+        .await;
+
+    let connected = tincans::connect_repos(&alice, &bob).await;
+
+    let doc = alice.create(Automerge::new()).await.unwrap();
+    drop(doc);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(observer.closed_count(), 0);
+
+    connected.disconnect().await;
+    wait_for_closed_count(&observer, 1).await;
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test]
+async fn disconnected_peers_do_not_evict_while_handle_is_alive() {
+    init_logging();
+
+    let observer = CountingObserver::default();
+    let alice = Repo::build_tokio()
+        .with_peer_id(PeerId::from("alice"))
+        .with_observer(observer.clone())
+        .load()
+        .await;
+
+    let bob = Repo::build_tokio()
+        .with_peer_id(PeerId::from("bob"))
+        .load()
+        .await;
+
+    let connected = tincans::connect_repos(&alice, &bob).await;
+
+    let doc = alice.create(Automerge::new()).await.unwrap();
+    connected.disconnect().await;
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(observer.closed_count(), 0);
+
+    drop(doc);
+    wait_for_closed_count(&observer, 1).await;
 
     alice.stop().await;
     bob.stop().await;

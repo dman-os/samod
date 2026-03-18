@@ -37,4 +37,8 @@ impl EstablishedConnection {
         self.document_subscriptions
             .insert(document_id, PeerDocState::empty());
     }
+
+    pub fn remove_document_subscription(&mut self, document_id: &DocumentId) {
+        self.document_subscriptions.remove(document_id);
+    }
 }

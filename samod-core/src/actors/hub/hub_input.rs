@@ -19,6 +19,16 @@ pub(crate) enum HubInput {
         actor_id: DocumentActorId,
         message: DocToHubMsgPayload,
     },
+    /// Local code acquired a new handle/lease to a document actor.
+    LocalHandlesAcquired {
+        document_id: crate::DocumentId,
+        generation: u64,
+    },
+    /// The final local handle/lease for a document actor was dropped.
+    LocalHandlesDropped {
+        document_id: crate::DocumentId,
+        generation: u64,
+    },
     /// Notification that a network connection has been lost externally
     ConnectionLost {
         connection_id: ConnectionId,
